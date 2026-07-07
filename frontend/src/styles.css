@@ -1,0 +1,339 @@
+/* rescue-pose 관제 글로벌 셸 — tunnel 다크/레드 관제 디자인 토큰.
+   페이지(Dashboard/Settings)는 tunnel 이식이라 인라인 style(C/s 객체)을 쓰되,
+   아래 :root 토큰이 정본 팔레트이고 body/html 셸이 언스타일 영역까지 다크로 통일한다.
+   (하단 라이트 .app/table/summary 클래스는 미라우팅 CamerasPage 전용 레거시 — 미사용.) */
+
+:root {
+  /* 다크/레드 관제 팔레트 */
+  --rp-bg: #0a0d12; /* 앱 배경 */
+  --rp-panel: #11151c; /* 패널/카드 */
+  --rp-panel-2: #161b24; /* 중첩 패널(항목 카드) */
+  --rp-border: #232a36;
+  --rp-text: #e6edf3;
+  --rp-muted: #8b95a5;
+  --rp-red: #e5484d; /* 강조/위험(lying) */
+  --rp-amber: #e0a23b; /* 주의(sitting) */
+  --rp-green: #3fb950; /* 정상(standing)/LIVE */
+  --rp-blue: #4493f8;
+  /* 카드/패널 토큰 */
+  --rp-radius: 12px;
+  --rp-radius-sm: 8px;
+  --rp-panel-pad: clamp(0.6rem, 0.62vw, 1rem);
+  --rp-page-pad: clamp(0.5rem, 0.72vw, 1rem);
+  --rp-gap: clamp(0.45rem, 0.55vw, 1rem);
+  --rp-gap-sm: clamp(0.38rem, 0.46vw, 0.75rem);
+  --rp-topbar-h: clamp(48px, 5.2vh, 56px);
+  --rp-topbar-pad-y: clamp(0.42rem, 0.42vw, 0.75rem);
+  --rp-topbar-pad-x: clamp(0.8rem, 0.86vw, 1.25rem);
+  --rp-cam-body-max-h: clamp(250px, 32vh, 560px);
+  --rp-event-head-h: clamp(28px, 3vh, 34px);
+  --rp-event-row-h: clamp(32px, 3.35vh, 40px);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  margin: 0;
+  padding: 0;
+  font-size: clamp(13px, 0.74vw, 16px);
+  /* 스크롤바 거터 항상 예약 → 긴/짧은 페이지 폭 동일(topbar 정렬 흔들림 방지) */
+  overflow-y: scroll;
+  scrollbar-gutter: stable;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto,
+    "Apple SD Gothic Neo", "Noto Sans KR", "Malgun Gothic", sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--rp-text);
+  background: var(--rp-bg);
+}
+
+/* 레이아웃 */
+.app {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 24px 16px;
+}
+
+h1 {
+  margin: 0 0 4px;
+  font-size: 22px;
+}
+
+.subtitle {
+  margin: 0;
+  color: #6b7280;
+}
+
+/* 테이블 — 목록/CRUD (레거시 라이트, CamerasPage `.app` 전용으로 스코프 — bare 셀렉터가
+   대시보드 다크 테이블로 누수하던 버그 수정) */
+.app table {
+  width: 100%;
+  border-collapse: collapse;
+  background: #fff;
+}
+
+.app th,
+.app td {
+  padding: 8px 12px;
+  border: 1px solid #e5e7eb;
+  text-align: left;
+}
+
+.app th {
+  background: #f3f4f6;
+  font-weight: 600;
+}
+
+.app tbody tr:nth-child(even) {
+  background: #f9fafb;
+}
+
+/* 버튼 */
+button {
+  font: inherit;
+  padding: 6px 12px;
+  border: 1px solid #d1d5db;
+  border-radius: 4px;
+  background: #fff;
+  color: #1f2937;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  background: #f3f4f6;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+button.primary {
+  border-color: #2563eb;
+  background: #2563eb;
+  color: #fff;
+}
+
+button.primary:hover:not(:disabled) {
+  background: #1d4ed8;
+}
+
+button.danger {
+  border-color: #dc2626;
+  color: #dc2626;
+}
+
+button.danger:hover:not(:disabled) {
+  background: #fef2f2;
+}
+
+/* 폼 */
+label {
+  display: block;
+  margin-bottom: 4px;
+  font-weight: 500;
+}
+
+input,
+select {
+  font: inherit;
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid #d1d5db;
+  border-radius: 4px;
+}
+
+.field {
+  margin-bottom: 12px;
+}
+
+/* 모달 — 등록 폼 */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.4);
+}
+
+.modal {
+  width: 100%;
+  max-width: 420px;
+  padding: 20px;
+  border-radius: 6px;
+  background: #fff;
+}
+
+.modal h2 {
+  margin: 0 0 16px;
+  font-size: 18px;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+/* NxN 그리드 플레이어 — columns 는 inline style 로 주입 */
+.grid {
+  display: grid;
+  gap: 8px;
+}
+
+.grid-cell {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  background: #e5e7eb; /* 회색 placeholder — phase4 에서 JPEG 플레이어로 교체 시 #000 */
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+}
+
+/* WHEP placeholder — phase4 WhepPlayer 가 video.srcObject 주입.
+   실 스트림 들어오면 회색 → 검정, 라벨은 위에 떠있음. */
+.grid-cell-video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #e5e7eb;
+}
+
+.grid-cell-sync {
+  background: #000;
+}
+
+.grid-cell-sync-frame {
+  background: #000;
+}
+
+.grid-cell-nosignal {
+  position: relative;
+  font-size: 12px;
+  color: #9ca3af;
+}
+
+/* 페이지 헤더 — 제목 + 등록 버튼 */
+.page-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+
+/* 요약 스트립 — 전체/온라인 (phase4 stats polling 이 채움) */
+.summary {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  border: 1px solid #e5e7eb;
+  background: #fff;
+  margin-bottom: 20px;
+}
+
+.summary-cell {
+  padding: 12px 16px;
+  border-right: 1px solid #e5e7eb;
+}
+
+.summary-cell:last-child {
+  border-right: none;
+}
+
+.summary-label {
+  font-size: 11px;
+  color: #6b7280;
+  margin-bottom: 4px;
+}
+
+.summary-value {
+  font-size: 28px;
+  font-weight: 300;
+  line-height: 1;
+}
+
+.summary-sub {
+  font-size: 13px;
+  color: #9ca3af;
+}
+
+/* 테이블 셀 */
+.cam-id {
+  font-size: 11px;
+  color: #9ca3af;
+  letter-spacing: 0.05em;
+}
+
+.cam-name {
+  font-weight: 500;
+}
+
+.url-cell {
+  font-size: 12px;
+  color: #6b7280;
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 상태 표시 — phase4 stats.active 가 토글 */
+.status {
+  font-size: 12px;
+}
+
+.status-on {
+  color: #16a34a;
+}
+
+.status-off {
+  color: #9ca3af;
+}
+
+/* 폼 힌트 / 에러 */
+.hint {
+  margin: 4px 0 0;
+  font-size: 11px;
+  color: #9ca3af;
+}
+
+.form-error {
+  margin: 0;
+  font-size: 12px;
+  color: #dc2626;
+}
+
+/* 라이브 그리드 섹션 — 다크 full-width 밴드 (제어패널 흰영역과 시각 구분) */
+.live-section {
+  margin-left: calc(50% - 50vw);
+  margin-right: calc(50% - 50vw);
+  margin-top: 28px;
+  padding: 16px 0 20px;
+  background: #111827;
+}
+
+/* 그리드 섹션 */
+.grid-heading {
+  margin: 0 0 12px;
+  padding: 0 16px;
+  font-size: 16px;
+  color: #fff;
+}
+
+.grid-empty {
+  color: #9ca3af;
+}

@@ -1,0 +1,15 @@
+fastapi==0.135.2
+uvicorn==0.42.0
+sqlalchemy==2.0.48
+pydantic==2.12.5
+python-dotenv==1.2.2
+httpx==0.28.1
+alembic
+pytest
+ultralytics==8.4.41
+torch==2.7.1
+torchvision==0.22.1
+opencv-python-headless==4.13.0.92
+numpy==2.4.4
+python-multipart==0.0.27
+websockets==16.0

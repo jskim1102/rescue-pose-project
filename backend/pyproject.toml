@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rescue-pose-backend"
+version = "0.1.0"
+requires-python = ">=3.11"
+# 의존성은 requirements.txt 를 단일 정본으로 유지 (Dockerfile 은 pip install -r,
+# 호스트 venv 는 pip install -e . → dynamic 로 같은 파일을 읽음 = dev/docker 파리티, drift 0).
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+# 프로젝트 루트(backend/)를 sys.path 에 추가 → `pytest tests/` 가 `app` 패키지를
+# import 할 수 있음 (`python -m pytest` 의 CWD-injection 에 의존하지 않도록).
+pythonpath = ["."]
+testpaths = ["tests"]
