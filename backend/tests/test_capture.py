@@ -1,4 +1,4 @@
-"""capture 스레드 DECODE cadence throttle 테스트 (codex #4, backend half).
+"""capture 스레드 DECODE cadence throttle 테스트 (backend half).
 
 문제: _capture_loop 이 매 iteration 마다 cap.read()(full-fps 디코드)를 호출하고
 worker 제출만 _next_submit_ts 로 스로틀했다 → 16 카메라에서 쓰지도 않는 프레임을
@@ -15,7 +15,6 @@ from __future__ import annotations
 import os
 import app.streaming.capture as capture
 from app.streaming.capture import VideoCaptureThread
-import numpy as _np
 import pytest
 
 
@@ -152,85 +151,6 @@ def test_capture_loop_uses_frame_pts_for_callback_timestamp(monkeypatch):
     assert captured_ts[1] - captured_ts[0] == pytest.approx(0.033, abs=0.005)
 
 
-def test_capture_loop_reopens_after_consecutive_read_failures(monkeypatch):
-    """OpenCV/FFmpeg 가 열린 cap 에서 ret=False 만 반복하면 cap 을 재오픈해 검출 제출을 복구한다."""
-    monkeypatch.setattr(capture, "_MAX_CONSECUTIVE_CAPTURE_FAILURES", 3, raising=False)
-    monkeypatch.setattr(capture, "_REOPEN_BACKOFF_SEC", 0.0, raising=False)
-    monkeypatch.setattr(capture.time, "sleep", lambda _: None)
-
-    clock = [1000.0]
-    monkeypatch.setattr(capture.time, "time", lambda: clock[0])
-
-    submitted = []
-    t = VideoCaptureThread(
-        "src",
-        "rtsp://fake",
-        frame_callback=lambda sid, frame, ts: submitted.append((sid, frame)),
-        inference_interval=0.0,
-    )
-
-    class BadCap:
-        def __init__(self):
-            self.reads = 0
-            self.released = False
-
-        def isOpened(self):
-            return True
-
-        def read(self):
-            self.reads += 1
-            clock[0] += 0.01
-            # 기존 구현이 재오픈하지 않으면 테스트가 무한 루프에 빠지지 않게 종료한다.
-            if self.reads >= 5:
-                t._running = False
-            return False, None
-
-        def grab(self):
-            return False
-
-        def get(self, prop):
-            return 0
-
-        def release(self):
-            self.released = True
-
-    class GoodCap:
-        def __init__(self):
-            self.released = False
-
-        def isOpened(self):
-            return True
-
-        def read(self):
-            clock[0] += 0.01
-            t._running = False
-            return True, object()
-
-        def grab(self):
-            return True
-
-        def get(self, prop):
-            return 0
-
-        def release(self):
-            self.released = True
-
-    bad = BadCap()
-    good = GoodCap()
-    opened = [bad, good]
-    monkeypatch.setattr(t, "_open_capture", lambda: opened.pop(0))
-
-    t._generation = 1
-    t._running = True
-    t._capture_loop(1)
-
-    assert len(submitted) == 1
-    assert submitted[0][0] == "src"
-    assert bad.released is True
-    assert good.released is True
-    assert opened == []
-
-
 # ── fix20: 캡처 스레드 좀비 generation fencing ────────────────────
 # _ensure_running 이 기동마다 _generation++ 하고 그 gen 을 스레드에 넘긴다. 느리게 열린
 # 구세대 스레드(좀비)가 현세대 공유 상태(_cap/_running)를 덮어쓰지 못하게 _capture_loop
@@ -323,8 +243,177 @@ def test_capture_loop_current_generation_opens_and_submits(monkeypatch):
     assert t._running is False
 
 
+# ── fix23: cap.isOpened()==True 디코더 stall 자가복구 ─────────────
+
+
+@pytest.mark.parametrize("failure_mode", ["grab", "read"])
+def test_capture_loop_reconnects_after_continuous_decode_failures(
+    monkeypatch, caplog, failure_mode
+):
+    """grab/read 진전이 5초 없으면 isOpened=True여도 새 capture로 교체한다."""
+    clock = [0.0]
+    monkeypatch.setattr(capture.time, "time", lambda: clock[0])
+    monkeypatch.setattr(capture.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(capture.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    t = VideoCaptureThread(
+        "src",
+        "rtsp://fake",
+        frame_callback=(lambda *_args: None) if failure_mode == "read" else None,
+        inference_interval=0.0 if failure_mode == "read" else 1.0,
+    )
+    t._generation = 1
+    t._running = True
+
+    class FailingCap(_GenFakeCap):
+        def _fail(self):
+            clock[0] += 1.0
+            if self.grabs + self.reads >= 8:  # fix가 없어도 테스트가 영원히 돌지 않게 종료
+                t._running = False
+
+        def grab(self):
+            self.grabs += 1
+            self._fail()
+            return False
+
+        def read(self):
+            self.reads += 1
+            self._fail()
+            return False, None
+
+    class RecoveredCap(_GenFakeCap):
+        def grab(self):
+            self.grabs += 1
+            clock[0] += 0.1
+            t._running = False
+            return True
+
+        def read(self):
+            self.reads += 1
+            clock[0] += 0.1
+            t._running = False
+            return True, object()
+
+    first = FailingCap()
+    second = RecoveredCap()
+    opened = [first, second]
+    monkeypatch.setattr(t, "_open_capture", lambda: opened.pop(0))
+
+    with caplog.at_level("WARNING"):
+        t._capture_loop(1)
+
+    assert opened == []
+    assert first.released is True
+    assert second.grabs + second.reads == 1
+    warnings = [r for r in caplog.records if "decoder stall" in r.message]
+    assert len(warnings) == 1
+
+
+def test_reconnect_resets_pts_and_fps_but_preserves_submit_phase(monkeypatch):
+    """새 연결은 옛 프레임 계보를 버리되 source 고유 제출 위상은 유지한다."""
+    wall = [100.0]
+    monkeypatch.setattr(capture.time, "time", lambda: wall[0])
+    monkeypatch.setattr(capture.time, "sleep", lambda _seconds: None)
+    t = VideoCaptureThread(
+        "src",
+        "rtsp://fake",
+        inference_interval=0.5,
+    )
+    t._generation = 1
+    t._running = True
+    old = _GenFakeCap()
+    new = _GenFakeCap()
+    t._cap = old
+    t._pts_origin_wall = 90.0
+    t._last_pts_msec = 1234.0
+    t._frame_interval_ewma = 1.0 / 30.0
+    t._last_frame_monotonic = 49.0
+    t._fps_samples = 12
+    phase = t._submit_phase
+    monkeypatch.setattr(t, "_open_capture", lambda: new)
+
+    result = t._reconnect_capture(old, 1)
+
+    assert result is new
+    assert t._cap is new
+    assert old.released is True
+    assert t._pts_origin_wall is None and t._last_pts_msec is None
+    assert t.source_fps == 0.0
+    assert t._last_frame_monotonic is None and t._fps_samples == 0
+    assert t._submit_phase == phase
+    assert t._next_submit_ts == pytest.approx(t._phase_deadline(wall[0], 0.5))
+
+
+def test_reconnect_generation_change_cannot_clobber_current_capture(monkeypatch):
+    """재연결 open 중 세대가 바뀌면 새 cap을 버리고 현세대 공유 상태를 보존한다."""
+    monkeypatch.setattr(capture.time, "sleep", lambda _seconds: None)
+    t = VideoCaptureThread("src", "rtsp://fake")
+    t._generation = 1
+    t._running = True
+    old = _GenFakeCap()
+    current = _GenFakeCap()
+    new = _GenFakeCap()
+    t._cap = current
+
+    def superseding_open():
+        t._generation = 2
+        return new
+
+    monkeypatch.setattr(t, "_open_capture", superseding_open)
+
+    result = t._reconnect_capture(old, 1)
+
+    assert result is None
+    assert t._cap is current
+    assert old.released is True
+    assert new.released is True
+
+
+def test_reconnect_retries_closed_capture_with_one_episode_warning(monkeypatch, caplog):
+    """open 실패 cap은 release하고 재시도하되 stall episode 경고는 한 줄만 남긴다."""
+    monkeypatch.setattr(capture.time, "sleep", lambda _seconds: None)
+    t = VideoCaptureThread("src", "rtsp://fake")
+    t._generation = 1
+    t._running = True
+    old = _GenFakeCap()
+    closed = _GenFakeCap()
+    opened = _GenFakeCap()
+    closed.isOpened = lambda: False
+    candidates = [closed, opened]
+    monkeypatch.setattr(t, "_open_capture", lambda: candidates.pop(0))
+
+    with caplog.at_level("WARNING"):
+        result = t._reconnect_capture(old, 1)
+
+    assert result is opened
+    assert closed.released is True
+    assert candidates == []
+    warnings = [r for r in caplog.records if "decoder stall" in r.message]
+    assert len(warnings) == 1
+
+
+def test_reconnect_stop_during_backoff_does_not_open_new_capture(monkeypatch):
+    """force-stop이 backoff 중 들어오면 불필요한 RTSP socket을 새로 열지 않는다."""
+    t = VideoCaptureThread("src", "rtsp://fake")
+    t._generation = 1
+    t._running = True
+    old = _GenFakeCap()
+    opened = []
+
+    def stop_during_sleep(_seconds):
+        t._running = False
+
+    monkeypatch.setattr(capture.time, "sleep", stop_during_sleep)
+    monkeypatch.setattr(t, "_open_capture", lambda: opened.append(True))
+
+    result = t._reconnect_capture(old, 1)
+
+    assert result is None
+    assert opened == []
+    assert old.released is True
+
+
 # ─── StreamManager 소스 lifecycle: replace_source(F1) / remove_capture(F2) ───
-# CEO #268 (계보 SHARED 버그 정본 수정):
+# 계보 SHARED 버그 정본 수정:
 #  F1(fix15): URL 편집 시 옛 source 캡처가 안정 source_id 로 재사용돼 잔존 → replace_source 가
 #             옛 캡처 force-stop + 새 source 재생성(뷰어 ref 보존)으로 교체.
 #  F2(fix16): 삭제 시 stop_capture 1회(ref-count 감소)만 → viewer 2+면 스레드 생존(계속 YOLO)
@@ -340,7 +429,14 @@ from app.streaming.manager import StreamManager
 class _FakeThread:
     """VideoCaptureThread 대역 — 실 RTSP/스레드 없이 ref_count lifecycle 만 모사."""
 
-    def __init__(self, source_id, source, *, frame_callback=None, inference_interval=0.0):
+    def __init__(
+        self,
+        source_id,
+        source,
+        *,
+        frame_callback=None,
+        inference_interval=0.0,
+    ):
         self.source_id = source_id
         self.source = source
         self._ref = 0
@@ -393,6 +489,9 @@ class _FakeThread:
     def set_inference_interval(self, interval):
         pass
 
+    @property
+    def source_fps(self):
+        return 30.0
 
 def _bare_manager():
     """InferenceWorker/dispatch 안 띄우고 lifecycle 상태만 갖춘 매니저."""
@@ -400,78 +499,23 @@ def _bare_manager():
     m._captures = {}
     m._lock = threading.Lock()
     m._inference_interval = 0.033
+    m._min_interval = 0.01
+    m._max_interval = 1.0
+    m._headroom = 0.85
+    m._target_fps_max = 100.0
     m._latest_results = {}
     m._results_lock = threading.Lock()
     m._per_source_enabled = {}
     m._per_source_conf = {}
     m._per_source_models = {}
-    m._per_source_annotated = {}
     m._per_source_lock = threading.Lock()
-    # rescue-pose adaptation: replace_source/remove_capture 의 rescue pop 핸드머지가 이 속성들을
-    # 참조하므로 bare 매니저에도 갖춰야 AttributeError 없이 lifecycle 이 돈다(정본과의 divergence).
-    m._rescue_trackers = {}
-    m._latest_rescue = {}
-    m._rescue_end_events = {}
-    m._rescue_lock = threading.Lock()
-    m._tombstones = {}  # H1 tombstone (CEO #289/#295) — start_capture/replace_source create 분기 참조
+    m._tombstones = {}
+    m._telemetry = manager_mod.InferenceTelemetry()
+    m._source_telemetry = {}
+    m._telemetry_lock = threading.Lock()
+    m._last_drop_count = 0
+    m._tune_requested = False
     return m
-
-
-class _FakeWorker:
-    def __init__(self):
-        self.submitted = []
-
-    def get_status(self):
-        return {"enabled": True}
-
-    def submit(self, req):
-        self.submitted.append(req)
-
-
-def test_submit_frame_requests_annotated_frame_only_for_synced_ipcam(monkeypatch):
-    """cam2 같은 동기화 allowlist source 만 worker 에 annotated JPEG 를 요청한다."""
-    monkeypatch.setattr(manager_mod, "SYNCED_POSE_STREAM_KEYS", {"rescue_pose__ipcam-cam2"})
-    m = _bare_manager()
-    worker = _FakeWorker()
-    m._worker = worker
-    sid = "ipcam-rescue_pose__ipcam-cam2"
-    m._per_source_enabled[sid] = True
-    m._per_source_models[sid] = ["yolo26n-pose.pt"]
-
-    m._submit_frame(sid, _np.zeros((360, 640, 3), dtype=_np.uint8), captured_at=1.0)
-
-    assert worker.submitted[-1].want_annotated is True
-
-
-def test_submit_frame_keeps_nvr_default_without_annotated_frame(monkeypatch):
-    """allowlist 밖(NVR/cam1) source 는 기존 좌표-only 경로를 유지한다."""
-    monkeypatch.setattr(manager_mod, "SYNCED_POSE_STREAM_KEYS", {"rescue_pose__ipcam-cam2"})
-    m = _bare_manager()
-    worker = _FakeWorker()
-    m._worker = worker
-    sid = "ipcam-rescue_pose__ipcam-nvr"
-    m._per_source_enabled[sid] = True
-    m._per_source_models[sid] = ["yolo26n-pose.pt"]
-
-    m._submit_frame(sid, _np.zeros((360, 640, 3), dtype=_np.uint8), captured_at=1.0)
-
-    assert worker.submitted[-1].want_annotated is False
-
-
-def test_submit_frame_requests_annotated_frame_for_dynamic_source_setting(monkeypatch):
-    """URL 자동분류 결과는 stream_manager per-source 설정으로 worker 요청에 반영된다."""
-    monkeypatch.setattr(manager_mod, "SYNCED_POSE_STREAM_KEYS", set())
-    m = _bare_manager()
-    worker = _FakeWorker()
-    m._worker = worker
-    sid = "ipcam-rescue_pose__ipcam-auto"
-    m._per_source_enabled[sid] = True
-    m._per_source_models[sid] = ["yolo26n-pose.pt"]
-
-    m.set_source_annotated_frame(sid, True)
-    m._submit_frame(sid, _np.zeros((360, 640, 3), dtype=_np.uint8), captured_at=1.0)
-
-    assert worker.submitted[-1].want_annotated is True
 
 
 # ── F2 fix16: remove_capture ─────────────────────────────────────
@@ -508,25 +552,131 @@ def test_stop_capture_ref_counted_leaves_thread_running_with_two_viewers(monkeyp
 
 
 def test_remove_capture_clears_per_source_settings(monkeypatch):
-    """카메라 소멸 시 per-source enabled/conf/models 캐시도 정리."""
+    """카메라 소멸 시 per-source 설정과 bounded telemetry 캐시도 정리."""
     monkeypatch.setattr(manager_mod, "VideoCaptureThread", _FakeThread)
     m = _bare_manager()
     m.start_capture("s", "rtsp://a")
     m.set_source_conf_threshold("s", 0.7)
     m.set_source_models("s", ["yolo"])
     m.set_source_inference_enabled("s", False)
+    m._source_telemetry["s"] = manager_mod.SourceTelemetry(submitted=3, received=2)
 
     m.remove_capture("s")
 
     assert m.get_source_conf_threshold("s") is None
     assert m.get_source_models("s") is None
-    assert m.is_source_inference_enabled("s") is False  # 키 제거 → 기본값(OFF) 복귀
+    assert m.is_source_inference_enabled("s") is True  # 키 제거 → 기본값 복귀
+    assert "s" not in m._source_telemetry
 
 
 def test_remove_capture_absent_is_noop(monkeypatch):
     monkeypatch.setattr(manager_mod, "VideoCaptureThread", _FakeThread)
     m = _bare_manager()
     m.remove_capture("missing")  # 예외 없이 통과
+
+
+# ── H1: delete↔WS start_capture TOCTOU tombstone ─────────────────
+
+def test_remove_capture_tombstones_source_blocking_resurrection(monkeypatch):
+    """H1 회귀락: remove_capture 가 tombstone 등록 → 삭제 직후 in-flight(stale) WS 의 start_capture 가
+    삭제된 카메라 캡처를 resurrect 하지 못한다(create 거부, False). tombstone 체크를 지우면 재생성돼 FAIL."""
+    monkeypatch.setattr(manager_mod, "VideoCaptureThread", _FakeThread)
+    m = _bare_manager()
+    m.start_capture("s", "rtsp://x")     # 캡처 존재
+    m.remove_capture("s")                # 삭제 → tombstone 등록
+    assert "s" not in m._captures
+
+    started = m.start_capture("s", "rtsp://x")  # 삭제 직후 stale WS 연결
+    assert started is False              # resurrect 거부
+    assert "s" not in m._captures        # 재생성 안 됨
+
+
+def test_tombstone_expires_allowing_recreate(monkeypatch):
+    """tombstone 은 TTL 후 만료 → create 허용 + 만료 항목 청소(무한증식 방지)."""
+    monkeypatch.setattr(manager_mod, "VideoCaptureThread", _FakeThread)
+    m = _bare_manager()
+    m.start_capture("s", "rtsp://x")
+    m.remove_capture("s")
+    # tombstone 을 TTL+1 초 이전으로 조작(만료 모사)
+    m._tombstones["s"] = m._tombstones["s"] - (StreamManager._TOMBSTONE_TTL + 1)
+
+    started = m.start_capture("s", "rtsp://x")
+    assert started is True
+    assert m._captures["s"].source == "rtsp://x"
+    assert "s" not in m._tombstones      # 만료 항목 청소됨
+
+
+def test_tombstone_does_not_block_reuse_of_live_entry(monkeypatch):
+    """tombstone 은 create 분기만 막는다 — 이미 살아있는 엔트리 재사용(2번째 뷰어)은 통과."""
+    monkeypatch.setattr(manager_mod, "VideoCaptureThread", _FakeThread)
+    m = _bare_manager()
+    m.start_capture("s", "rtsp://x")     # 엔트리 존재
+    m._tombstones["s"] = float("inf")    # (부자연스럽지만) tombstone 있어도 재사용은 통과해야
+    started = m.start_capture("s", "rtsp://x")
+    assert started is True
+    assert m._captures["s"].ref_count == 2
+
+
+def test_replace_source_refuses_idle_create_for_tombstoned(monkeypatch):
+    """H1 대칭 회귀락(gate): replace_source 의 idle-create(old=None)도 tombstone 된 sid 엔 엔트리를
+    신설하지 않는다 (update↔delete 경합으로 삭제된 카메라 dormant resurrection 방지). 체크 없으면
+    idle 엔트리 신설돼 FAIL."""
+    monkeypatch.setattr(manager_mod, "VideoCaptureThread", _FakeThread)
+    m = _bare_manager()
+    m.start_capture("s", "rtsp://x")
+    m.remove_capture("s")               # 삭제 → tombstone
+    assert "s" not in m._captures
+
+    changed = m.replace_source("s", "rtsp://new")  # 삭제된 카메라 URL 편집 경합
+    assert changed is False             # idle 엔트리 신설 거부
+    assert "s" not in m._captures
+
+
+def test_remove_capture_prunes_expired_tombstones(monkeypatch):
+    """H1 회귀락(gate): remove_capture 가 만료된 tombstone 을 전역 청소 → 무한증식 방지
+    (삭제된 sid 는 재조회 안 돼 lazy 청소가 안 먹으므로)."""
+    monkeypatch.setattr(manager_mod, "VideoCaptureThread", _FakeThread)
+    m = _bare_manager()
+    m._tombstones["old1"] = -1e9        # 확실히 만료(now - (-1e9) ≫ TTL)
+    m._tombstones["old2"] = -1e9
+    m.start_capture("s", "rtsp://x")
+    m.remove_capture("s")               # 새 tombstone 등록 + 만료 전역 청소
+    assert "old1" not in m._tombstones and "old2" not in m._tombstones  # 만료 청소됨
+    assert "s" in m._tombstones         # 방금 것은 유지(만료 전)
+
+
+def test_ensure_running_refuses_after_force_stop(monkeypatch):
+    """H1 근본 회귀락(gate): force_stop 은 영구 dead 표시 → _ensure_running 이 캡처를 다시 못 켠다
+    (reuse-branch 에서 delete 가 lock-밖 open 과 경합해도 삭제된 RTSP 재디코드 안 함). _dead 없으면
+    _running False + ref>0 라 스레드를 새로 만들어(재기동) FAIL."""
+    from app.streaming.capture import VideoCaptureThread
+
+    opened = {"n": 0}
+
+    class _FakeCap:
+        def isOpened(self):
+            return False
+
+        def grab(self):
+            return False
+
+        def read(self):
+            return False, None
+
+        def release(self):
+            pass
+
+    def _fake_open():
+        opened["n"] += 1
+        return _FakeCap()
+
+    t = VideoCaptureThread("s", "rtsp://x")
+    monkeypatch.setattr(t, "_open_capture", _fake_open)
+    t._ref_count = 1
+    t.force_stop()                        # 영구 dead
+    assert t._ensure_running() is False   # 재기동 거부
+    assert t._thread is None              # 스레드 아예 안 만듦 (short-circuit)
+    assert opened["n"] == 0               # _open_capture 미호출 → 삭제 카메라 재디코드 없음
 
 
 # ── F1 fix15: replace_source + start_capture 하드닝 ───────────────
@@ -560,7 +710,7 @@ def test_replace_source_noop_when_same_url(monkeypatch):
 
 
 def test_replace_source_creates_idle_entry_when_absent(monkeypatch):
-    """SHOULD-4(CEO #276/277): idle 카메라(캡처 없음) URL 편집 시 no-op 대신 ref-0 idle 엔트리를
+    """SHOULD-4: idle 카메라(캡처 없음) URL 편집 시 no-op 대신 ref-0 idle 엔트리를
     신설해 새 URL 을 권위로 기록한다. (옛 old=None no-op 이면 False + 엔트리 없음)."""
     monkeypatch.setattr(manager_mod, "VideoCaptureThread", _FakeThread)
     m = _bare_manager()
@@ -572,7 +722,7 @@ def test_replace_source_creates_idle_entry_when_absent(monkeypatch):
 
 
 def test_idle_camera_url_edit_first_connect_uses_new_url(monkeypatch):
-    """SHOULD-4 회귀락(CEO #276/277): idle 카메라 URL 편집 후 stale 첫 연결이 와도 NEW url 을 쓴다
+    """SHOULD-4 회귀락: idle 카메라 URL 편집 후 stale 첫 연결이 와도 NEW url 을 쓴다
     (replace_source 가 URL 권위를 기록 → create-only-if-absent 가 그 엔트리 재사용). 버그(old=None
     no-op)로 되돌리면 첫 연결이 stale url 로 persistent stale 엔트리를 만들어 FAIL."""
     monkeypatch.setattr(manager_mod, "VideoCaptureThread", _FakeThread)
@@ -705,7 +855,7 @@ def test_replace_source_cleans_orphan_when_removed_during_open(monkeypatch):
 
 
 def test_start_capture_no_phantom_ref_on_orphan_during_open(monkeypatch):
-    """BLOCKER 회귀락(증가side, CEO #274): start_capture 의 open 중 URL 교체(replace)가 끼어
+    """BLOCKER 회귀락(증가side): start_capture 의 open 중 URL 교체(replace)가 끼어
     target 이 밀려나면(orphan-return-False), 증가한 뷰어를 '현재 엔트리'에서 되돌려 ref 팽창(유령
     디코드 스레드)이 없다. 옛 설계(cap.start ref++ 락 밖 + orphan 시 current 미감소)면 new.ref=1 유령."""
     m = None
@@ -735,7 +885,7 @@ def test_start_capture_no_phantom_ref_on_orphan_during_open(monkeypatch):
 
 
 def test_start_capture_reuses_entry_ignoring_stale_source(monkeypatch):
-    """SHOULD 회귀락(CEO #274 + 게이트): create-only-if-absent — 엔트리가 있으면 넘어온 source 를
+    """SHOULD 회귀락(게이트): create-only-if-absent — 엔트리가 있으면 넘어온 source 를
     무시하고 기존 엔트리 재사용(url 권위=replace_source 단일화). stale WS 가 옛 url 로 정확한 캡처를
     덮지 않는다(F1 무력화 SHOULD 제거). 옛 mismatch-replace 설계면 여기서 stale 캡처로 교체돼 FAIL."""
     monkeypatch.setattr(manager_mod, "VideoCaptureThread", _FakeThread)
@@ -830,167 +980,6 @@ def test_ref_count_property_reflects_internal_counter():
     assert t.ref_count == 3
 
 
-# ── rescue-pose 안전 핸드머지 락인 (정본 divergence: canonical 엔 rescue 없음) ──
-# 삭제/URL편집 시 rescue tracker/상태를 폐기하지 않으면 소멸/교체된 카메라의 needs-rescue 가
-# 눌러앉아 허위 구조경보를 낸다(안전사고). remove_capture/replace_source 의 pop 을 지우면 FAIL.
-
-def test_remove_capture_pops_rescue_state(monkeypatch):
-    """★ 안전: 삭제 시 rescue tracker/최신상태 폐기 — 삭제된 카메라 needs-rescue 잔존(허위경보) 방지."""
-    monkeypatch.setattr(manager_mod, "VideoCaptureThread", _FakeThread)
-    m = _bare_manager()
-    m.start_capture("s", "rtsp://a")
-    m._rescue_trackers["s"] = object()
-    m._latest_rescue["s"] = (1.0, [])
-
-    m.remove_capture("s")
-
-    assert "s" not in m._rescue_trackers
-    assert "s" not in m._latest_rescue
-
-
-def test_replace_source_pops_rescue_state(monkeypatch):
-    """★ 안전: URL 교체 시 옛 카메라 rescue 상태 폐기 — 새 source 로 needs-rescue 잔상 이월(허위경보) 방지."""
-    monkeypatch.setattr(manager_mod, "VideoCaptureThread", _FakeThread)
-    m = _bare_manager()
-    m.start_capture("s", "rtsp://old")
-    m._rescue_trackers["s"] = object()
-    m._latest_rescue["s"] = (1.0, [])
-
-    m.replace_source("s", "rtsp://new")
-
-    assert "s" not in m._rescue_trackers
-    assert "s" not in m._latest_rescue
-
-
-# ── H1: delete↔WS start_capture TOCTOU tombstone (CEO #289/#295) ───────
-
-def test_remove_capture_tombstones_source_blocking_resurrection(monkeypatch):
-    """H1 회귀락: remove_capture 가 tombstone 등록 → 삭제 직후 in-flight(stale) WS 의 start_capture 가
-    삭제된 카메라 캡처를 resurrect 하지 못한다(create 거부, False). tombstone 체크를 지우면 재생성돼 FAIL."""
-    monkeypatch.setattr(manager_mod, "VideoCaptureThread", _FakeThread)
-    m = _bare_manager()
-    m.start_capture("s", "rtsp://x")     # 캡처 존재
-    m.remove_capture("s")                # 삭제 → tombstone 등록
-    assert "s" not in m._captures
-
-    started = m.start_capture("s", "rtsp://x")  # 삭제 직후 stale WS 연결
-    assert started is False              # resurrect 거부
-    assert "s" not in m._captures        # 재생성 안 됨
-
-
-def test_tombstone_expires_allowing_recreate(monkeypatch):
-    """tombstone 은 TTL 후 만료 → create 허용 + 만료 항목 청소(무한증식 방지)."""
-    monkeypatch.setattr(manager_mod, "VideoCaptureThread", _FakeThread)
-    m = _bare_manager()
-    m.start_capture("s", "rtsp://x")
-    m.remove_capture("s")
-    # tombstone 을 TTL+1 초 이전으로 조작(만료 모사)
-    m._tombstones["s"] = m._tombstones["s"] - (StreamManager._TOMBSTONE_TTL + 1)
-
-    started = m.start_capture("s", "rtsp://x")
-    assert started is True
-    assert m._captures["s"].source == "rtsp://x"
-    assert "s" not in m._tombstones      # 만료 항목 청소됨
-
-
-def test_tombstone_does_not_block_reuse_of_live_entry(monkeypatch):
-    """tombstone 은 create 분기만 막는다 — 이미 살아있는 엔트리 재사용(2번째 뷰어)은 통과."""
-    monkeypatch.setattr(manager_mod, "VideoCaptureThread", _FakeThread)
-    m = _bare_manager()
-    m.start_capture("s", "rtsp://x")     # 엔트리 존재
-    m._tombstones["s"] = float("inf")    # (부자연스럽지만) tombstone 있어도 재사용은 통과해야
-    started = m.start_capture("s", "rtsp://x")
-    assert started is True
-    assert m._captures["s"].ref_count == 2
-
-
-def test_replace_source_refuses_idle_create_for_tombstoned(monkeypatch):
-    """H1 대칭 회귀락(gate): replace_source 의 idle-create(old=None)도 tombstone 된 sid 엔 엔트리를
-    신설하지 않는다 (update↔delete 경합으로 삭제된 카메라 dormant resurrection 방지). 체크 없으면
-    idle 엔트리 신설돼 FAIL."""
-    monkeypatch.setattr(manager_mod, "VideoCaptureThread", _FakeThread)
-    m = _bare_manager()
-    m.start_capture("s", "rtsp://x")
-    m.remove_capture("s")               # 삭제 → tombstone
-    assert "s" not in m._captures
-
-    changed = m.replace_source("s", "rtsp://new")  # 삭제된 카메라 URL 편집 경합
-    assert changed is False             # idle 엔트리 신설 거부
-    assert "s" not in m._captures
-
-
-def test_remove_capture_prunes_expired_tombstones(monkeypatch):
-    """H1 회귀락(gate): remove_capture 가 만료된 tombstone 을 전역 청소 → 무한증식 방지
-    (삭제된 sid 는 재조회 안 돼 lazy 청소가 안 먹으므로)."""
-    monkeypatch.setattr(manager_mod, "VideoCaptureThread", _FakeThread)
-    m = _bare_manager()
-    m._tombstones["old1"] = -1e9        # 확실히 만료(now - (-1e9) ≫ TTL)
-    m._tombstones["old2"] = -1e9
-    m.start_capture("s", "rtsp://x")
-    m.remove_capture("s")               # 새 tombstone 등록 + 만료 전역 청소
-    assert "old1" not in m._tombstones and "old2" not in m._tombstones  # 만료 청소됨
-    assert "s" in m._tombstones         # 방금 것은 유지(만료 전)
-
-
-def test_ensure_running_refuses_after_force_stop(monkeypatch):
-    """H1 근본 회귀락(gate): force_stop 은 영구 dead 표시 → _ensure_running 이 캡처를 다시 못 켠다
-    (reuse-branch 에서 delete 가 lock-밖 open 과 경합해도 삭제된 RTSP 재디코드 안 함). _dead 없으면
-    _running False + ref>0 라 스레드를 새로 만들어(재기동) FAIL."""
-    from app.streaming.capture import VideoCaptureThread
-
-    opened = {"n": 0}
-
-    class _FakeCap:
-        def isOpened(self):
-            return False
-
-        def grab(self):
-            return False
-
-        def read(self):
-            return False, None
-
-        def release(self):
-            pass
-
-    def _fake_open():
-        opened["n"] += 1
-        return _FakeCap()
-
-    t = VideoCaptureThread("s", "rtsp://x")
-    monkeypatch.setattr(t, "_open_capture", _fake_open)
-    t._ref_count = 1
-    t.force_stop()                        # 영구 dead
-    assert t._ensure_running() is False   # 재기동 거부
-    assert t._thread is None              # 스레드 아예 안 만듦 (short-circuit)
-    assert opened["n"] == 0               # _open_capture 미호출 → 삭제 카메라 재디코드 없음
-
-
-def test_start_capture_refuses_resurrect_when_force_stopped_during_open(monkeypatch):
-    """H1 신규 race 회귀락: reuse-branch(엔트리 존재)에서 2번째 뷰어의 open(_ensure_running) 도중 그
-    캡처가 force_stop(delete 경합)되면 _dead 로 _ensure_running False → 삭제 카메라를 resurrect 하지
-    않는다. _dead 가드 없으면 죽은 캡처가 다시 running 으로 되살아나 FAIL."""
-    holder = {}
-
-    class _DieDuringOpen(_FakeThread):
-        def _ensure_running(self):
-            # reuse 2번째 뷰어 open 시점에 delete 가 이 캡처를 force_stop(_dead) — 경합 모사.
-            if holder.get("arm") and not holder.get("fired"):
-                holder["fired"] = True
-                self.force_stop()
-            return super()._ensure_running()
-
-    monkeypatch.setattr(manager_mod, "VideoCaptureThread", _DieDuringOpen)
-    m = _bare_manager()
-    m.start_capture("s", "rtsp://x")     # 엔트리 running (arm off → inject 안 함)
-    cap = m._captures["s"]
-    holder["arm"] = True
-
-    started = m.start_capture("s", "rtsp://x")  # 2번째 뷰어 reuse; open 중 force_stop→_dead
-    assert started is False              # _ensure_running False → resurrect 거부
-    assert not cap.is_running            # 죽은 캡처 재기동 안 됨
-
-
 # ── fix19: worker 사망 감지 watchdog (respawn + 10s 백오프) ────────
 # _dispatch_loop(데몬 스레드, 이벤트루프 아님 → H2 무관)이 ~5s 주기로 _maybe_respawn_worker 를
 # 호출한다. 여기선 그 respawn 결정(is_alive→ERROR→start→백오프)만 결정적으로 잠근다.
@@ -1056,8 +1045,14 @@ def test_dispatch_loop_survives_drain_exception_and_resumes(monkeypatch):
 
     class _StubResult:
         source_id = "camX"
+        timestamp = 0.0
+        infer_ms = 0.0
+        idle_ms = 0.0
 
     res = _StubResult()
+    # 새 result fence 계약: remove_capture 뒤 late result는 버리고, 아직 추적 중인
+    # source 결과만 캐시한다. 이 테스트는 후자(정상 복구)를 모사한다.
+    m._captures["camX"] = type("_Tracked", (), {"is_running": False})()
     calls = {"n": 0}
 
     class _Worker:
@@ -1080,3 +1075,32 @@ def test_dispatch_loop_survives_drain_exception_and_resumes(monkeypatch):
 
     assert calls["n"] >= 3                          # 1차 예외 뒤에도 계속 tick(생존)
     assert m._latest_results.get("camX") is res     # 복구 후 캐싱 재개
+
+
+def test_dispatch_watchdog_backoff_holds_when_start_raises():
+    """fix22: start() 가 raise(persistent OOM spawn 실패)해도 백오프가 유지된다 — attempt-based.
+    타임스탬프를 start() 前에 갱신하므로, 첫 tick 의 start() 가 던져도 10s 내 두 번째 tick 은
+    재시도하지 않는다(5s 마다 spawn-storm 방지). 성공기반이면 raise 시 타임스탬프 미갱신 → 매 tick 재시도."""
+    m = _bare_manager()
+    m._last_worker_respawn = 0.0
+
+    starts = {"n": 0}
+
+    class _FailingWorker:
+        def is_alive(self):
+            return False
+
+        def start(self):
+            starts["n"] += 1
+            raise RuntimeError("spawn failed (OOM)")
+
+    m._worker = _FailingWorker()
+
+    # 첫 tick — 죽음 감지 → start() 시도 1회(예외는 호출자/armor 로 전파).
+    with pytest.raises(RuntimeError):
+        m._maybe_respawn_worker()
+    assert starts["n"] == 1
+
+    # 10s 백오프 창 내 두 번째 tick — start() 가 던졌어도 타임스탬프가 갱신됐으므로 재시도 안 함.
+    m._maybe_respawn_worker()  # 백오프로 start() 미호출 → 예외 없음
+    assert starts["n"] == 1

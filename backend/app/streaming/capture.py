@@ -1,8 +1,8 @@
 """단일 영상 소스의 캡처 스레드 — 추론 제출 전용(좌표만).
 
 `source` 가 `int` 면 V4L2 웹캠, `str` 이면 RTSP 등 OpenCV 가 인식하는 URL.
-rtsp-detection: JPEG 인코딩 경로 제거 — 영상은 mediamtx WHEP 가 담당하고
-이 스레드는 추론 워커에 raw 프레임만 제출한다(detection 좌표 전용).
+rtsp-keypoint: JPEG 인코딩 경로 제거 — 영상은 mediamtx WHEP 가 담당하고
+이 스레드는 추론 워커에 raw 프레임만 제출한다(keypoint 좌표 전용).
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import math
 import os
 import threading
 import time
+import zlib
 from typing import Callable, Optional, Union
 
 import cv2
@@ -19,7 +20,7 @@ import numpy as np
 
 from app.masking import mask_rtsp_credentials
 
-logger = logging.getLogger("rtsp-streaming.streaming.capture")
+logger = logging.getLogger("rtsp-keypoint.streaming.capture")
 
 # Type alias
 SourceType = Union[int, str]
@@ -35,8 +36,8 @@ _LOW_LATENCY_FFMPEG_OPTIONS = (
     "probesize;32"
 )
 _MAX_PTS_FUTURE_SEC = 0.25
-_MAX_CONSECUTIVE_CAPTURE_FAILURES = 30
-_REOPEN_BACKOFF_SEC = 1.0
+STALL_SEC = 5.0
+RECONNECT_BACKOFF_SEC = 2.0
 
 
 class VideoCaptureThread:
@@ -65,7 +66,16 @@ class VideoCaptureThread:
         # 누적 drift 가 없음. (예전 `last_submit + interval >= now` 방식은 캡처 fps 와
         # 목표 fps 의 비율이 정수가 아닐 때 1 frame 씩 밀려 7.5fps 등으로 떨어짐.)
         self._inference_interval = inference_interval
-        self._next_submit_ts: float = 0.0
+        # 프로세스 재시작 뒤에도 같은 source는 같은 위상을 쓴다. Python hash는 실행마다
+        # salt가 달라지므로 crc32로 0..1 사이의 안정 위상을 만든다.
+        self._submit_phase = (zlib.crc32(source_id.encode("utf-8")) + 0.5) / (2**32)
+        self._next_submit_ts = self._phase_deadline(time.time(), inference_interval)
+
+        # 실제 capture frame advance(grab/read 성공) fps의 scalar EWMA. 과거의 무한
+        # timestamp deque를 되살리지 않고 카메라 fps 상한(B)을 추정한다.
+        self._frame_interval_ewma = 0.0
+        self._last_frame_monotonic: Optional[float] = None
+        self._fps_samples = 0
 
         self._cap: Optional[cv2.VideoCapture] = None
         self._pts_origin_wall: Optional[float] = None
@@ -190,12 +200,48 @@ class VideoCaptureThread:
             return self._ref_count
 
     def set_inference_interval(self, interval: float) -> None:
-        """활성 캠 수 변동 시 manager 가 호출 — 제출 케이던스 동적 갱신.
+        """autotuner가 호출 — 제출 케이던스 동적 갱신.
         float 단일 대입은 CPython 에서 원자적이고 캡처 루프가 매 iteration 마다
         self._inference_interval 를 읽으므로 락 불요."""
+        old_interval = self._inference_interval
         self._inference_interval = interval
+        if interval < old_interval:
+            # autotuner가 속도를 올렸는데 옛 느린 deadline을 그대로 기다리지 않되, 모든 source를
+            # now+interval 한 점에 모으지 않는다. 안정 위상으로 latest-wins burst를 막는다.
+            self._next_submit_ts = self._phase_deadline(time.time(), interval)
 
-    # (get_source_fps 제거 — 유일 호출처였던 manager.get_capture_stats 가 死코드로 제거됨)
+    def _phase_deadline(self, now: float, interval: float) -> float:
+        """현재 주기 안의 source 고유 위상에서 다음 deadline을 반환한다."""
+        if interval <= 0.0:
+            return now
+        cycle_start = math.floor(now / interval) * interval
+        deadline = cycle_start + self._submit_phase * interval
+        if deadline <= now:
+            deadline += interval
+        return deadline
+
+    @property
+    def source_fps(self) -> float:
+        """고정 메모리 frame-interval EWMA로 추정한 실제 카메라 fps.
+
+        순간 fps(1/dt)를 평균하면 프레임 지터 때문에 상향 편향되므로 dt를 먼저
+        평활한 뒤 한 번만 역수로 바꾼다.
+        """
+        return 1.0 / self._frame_interval_ewma if self._frame_interval_ewma > 0.0 else 0.0
+
+    def _record_frame_advance(self, now: float) -> None:
+        previous = self._last_frame_monotonic
+        self._last_frame_monotonic = now
+        if previous is None or now <= previous:
+            return
+        sample_interval = now - previous
+        self._fps_samples += 1
+        if self._fps_samples == 1:
+            self._frame_interval_ewma = sample_interval
+        else:
+            self._frame_interval_ewma += 0.2 * (
+                sample_interval - self._frame_interval_ewma
+            )
 
     # ── 내부 ────────────────────────────────────────────────────
 
@@ -247,6 +293,58 @@ class VideoCaptureThread:
         self._last_pts_msec = pts_msec
         return ts
 
+    def _reconnect_capture(
+        self,
+        old_cap: cv2.VideoCapture,
+        gen: int,
+    ) -> Optional[cv2.VideoCapture]:
+        """진전 없는 decoder를 닫고 같은 세대일 때만 새 capture를 공유 상태에 연결한다."""
+        logger.warning("Capture %s decoder stall — reconnecting", self.source_id)
+        old_cap.release()
+
+        with self._lock:
+            if not self._running or gen != self._generation:
+                return None
+
+        # 새 연결은 PTS·프레임 간격 계보가 모두 불연속이다. 재연결 중에는
+        # source_fps=0으로 보여 autotuner가 옛 30fps를 계속 예약하지 않게 한다.
+        self._pts_origin_wall = None
+        self._last_pts_msec = None
+        self._frame_interval_ewma = 0.0
+        self._last_frame_monotonic = None
+        self._fps_samples = 0
+
+        while True:
+            with self._lock:
+                if not self._running or gen != self._generation:
+                    return None
+            time.sleep(RECONNECT_BACKOFF_SEC)
+            # force_stop/supersede가 backoff 중 발생했으면 새 socket을 열지 않는다.
+            with self._lock:
+                if not self._running or gen != self._generation:
+                    return None
+
+            new_cap = self._open_capture()
+            if not new_cap.isOpened():
+                new_cap.release()
+                continue
+
+            with self._lock:
+                if not self._running or gen != self._generation:
+                    accepted = False
+                else:
+                    self._cap = new_cap
+                    accepted = True
+            if not accepted:
+                new_cap.release()
+                return None
+
+            # source 고유 위상은 유지하고 deadline만 현재 주기에서 다시 계산한다.
+            self._next_submit_ts = self._phase_deadline(
+                time.time(), self._inference_interval
+            )
+            return new_cap
+
     def _capture_loop(self, gen: int) -> None:
         """캡처 + 추론 제출 (단일 스레드, 좌표 전용 — JPEG 인코딩 없음).
 
@@ -258,7 +356,7 @@ class VideoCaptureThread:
         """
         cap = self._open_capture()
 
-        # 로그용 source — rtsp_url 은 자격증명 마스킹(codex #2), 정수 webcam source 는 그대로.
+        # 로그용 source — rtsp_url 은 자격증명 마스킹, 정수 webcam source 는 그대로.
         safe_source = (
             mask_rtsp_credentials(self.source)
             if isinstance(self.source, str)
@@ -286,54 +384,12 @@ class VideoCaptureThread:
             return
 
         logger.info("Capture %s 시작 (source=%s, gen=%d)", self.source_id, safe_source, gen)
-        consecutive_failures = 0
-
-        def reopen_capture(reason: str) -> bool:
-            nonlocal cap, consecutive_failures
-            logger.warning("Capture %s 재연결: %s", self.source_id, reason)
-            cap.release()
-            with self._lock:
-                if gen == self._generation:
-                    self._cap = None
-            self._pts_origin_wall = None
-            self._last_pts_msec = None
-            self._next_submit_ts = 0.0
-            consecutive_failures = 0
-
-            while self._running and gen == self._generation:
-                time.sleep(_REOPEN_BACKOFF_SEC)
-                new_cap = self._open_capture()
-                if not new_cap.isOpened():
-                    new_cap.release()
-                    logger.warning("Capture %s 재연결 실패: source=%s", self.source_id, safe_source)
-                    continue
-                with self._lock:
-                    if gen != self._generation or not self._running:
-                        new_cap.release()
-                        return False
-                    self._cap = new_cap
-                cap = new_cap
-                logger.info("Capture %s 재연결 성공 (gen=%d)", self.source_id, gen)
-                return True
-            return False
-
-        def note_capture_failure(op: str) -> bool:
-            nonlocal consecutive_failures
-            consecutive_failures += 1
-            if consecutive_failures >= _MAX_CONSECUTIVE_CAPTURE_FAILURES:
-                return reopen_capture(f"{op} 연속 실패 {consecutive_failures}회")
-            time.sleep(0.01)
-            return True
-
+        last_ok = time.time()
         try:
-            while self._running and gen == self._generation:
-                if not cap.isOpened():
-                    if not reopen_capture("capture closed"):
-                        break
-                    continue
+            while self._running and cap.isOpened() and gen == self._generation:
                 now = time.time()
 
-                # DECODE cadence 스로틀 (codex #4): 제출할 프레임만 read()(grab+decode)하고,
+                # DECODE cadence 스로틀: 제출할 프레임만 read()(grab+decode)하고,
                 # 그 사이 프레임은 grab()(패킷 drain, 디코드 X)으로만 흘려보낸다 — 16 카메라에서
                 # 쓰지도 않을 프레임을 full-fps 로 디코드하던 CPU/네트워크 낭비 제거.
                 submit_due = self._frame_cb is not None and now >= self._next_submit_ts
@@ -342,25 +398,43 @@ class VideoCaptureThread:
                     # 디코드 없이 버퍼만 비운다(최신 프레임 유지). inference_interval==0 이면
                     # submit_due 가 항상 True → 이 분기 미진입 → full-rate 디코드(하위호환).
                     if not cap.grab():
-                        if not note_capture_failure("grab"):
-                            break
+                        if time.time() - last_ok >= STALL_SEC:
+                            reconnected = self._reconnect_capture(cap, gen)
+                            if reconnected is None:
+                                break
+                            cap = reconnected
+                            last_ok = time.time()
+                            continue
+                        time.sleep(0.01)
+                    elif gen != self._generation:
+                        break
                     else:
-                        consecutive_failures = 0
+                        last_ok = time.time()
+                        self._record_frame_advance(time.monotonic())
                     continue
 
-                # 제출 시점 — 여기서만 실제 디코드.
+                # 제출 시점에만 한 번 decode한다.
                 ret, frame = cap.read()
                 read_ts = time.time()
                 if not ret:
-                    if not note_capture_failure("read"):
-                        break
+                    if read_ts - last_ok >= STALL_SEC:
+                        reconnected = self._reconnect_capture(cap, gen)
+                        if reconnected is None:
+                            break
+                        cap = reconnected
+                        last_ok = time.time()
+                        continue
+                    time.sleep(0.01)
                     continue
-                consecutive_failures = 0
-                captured_at = self._frame_timestamp(cap, read_ts)
 
-                # fix20: 제출 직전 세대 재확인 — 디코드 도중 superseded 되면 trailing 제출 차단.
+                # fix20: 디코드 직후 세대 재확인 — superseded면 shared metrics/제출 모두 차단.
                 if gen != self._generation:
                     break
+                last_ok = read_ts
+                frame_monotonic = time.monotonic()
+                self._record_frame_advance(frame_monotonic)
+
+                captured_at = self._frame_timestamp(cap, read_ts)
 
                 # 추론 워커에 raw 프레임 제출 (drift-free 쓰로틀링) — 좌표 전용.
                 # 이상적 다음 시각으로 진행 — 늦어졌으면 now 로 점프하여 누적 drift 없음.

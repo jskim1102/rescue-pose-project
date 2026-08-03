@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 from dotenv import load_dotenv
 
 # 런타임 env 로드 — backend/.env(있으면) + 프로젝트 루트 .env 둘 다.
-# 공유 인프라(CEO #115)는 런타임 env 를 프로젝트 루트 .env 에 두므로, bare import(pytest·검증
+# self-host MediaMTX의 offset 포트·자격증명은 프로젝트 루트 .env 에 두므로, bare import(pytest·검증
 # `python -c "import app.main"`)에서도 MEDIAMTX_API 등이 resolve 돼 아래 import-time fail-fast 가
 # 정상 설정에선 발화하지 않는다. override=False(기본): dev.sh/compose 가 이미 export 한 프로세스
 # env 가 우선이며 .env 가 덮어쓰지 않는다.
@@ -51,21 +51,6 @@ MEDIAMTX_RTSP_BASE_URL: str = (
     or _derive_mediamtx_rtsp_base(MEDIAMTX_API)
 )
 
-
-def _env_csv_set(name: str) -> set[str]:
-    return {
-        key.strip()
-        for key in (os.getenv(name, "") or "").split(",")
-        if key.strip()
-    }
-
-
-MEDIAMTX_DETECTION_FANOUT_STREAM_KEYS: set[str] = _env_csv_set("MEDIAMTX_DETECTION_FANOUT_STREAM_KEYS")
-# 같은 추론 프레임에 keypoint 를 그려 보내는 동기화 표시 강제 allowlist/denylist.
-# 자동 URL 분류가 애매한 카메라를 수동으로 보정할 때 사용한다.
-SYNCED_POSE_STREAM_KEYS: set[str] = _env_csv_set("SYNCED_POSE_STREAM_KEYS")
-SYNCED_POSE_DISABLED_STREAM_KEYS: set[str] = _env_csv_set("SYNCED_POSE_DISABLED_STREAM_KEYS")
-
 # mediamtx 인증(#100) — backend user 로 API 호출 시 Basic auth. 비번 비우면 무인증(로컬/테스트 하위호환).
 MEDIAMTX_BACKEND_USER: str = os.getenv("MEDIAMTX_BACKEND_USER", "backend")
 MEDIAMTX_BACKEND_PASS: str = os.getenv("MEDIAMTX_BACKEND_PASS", "")
@@ -97,19 +82,31 @@ def _env_float(name: str, default: float) -> tuple[float, str | None]:
 YOLO_CONF_THRESHOLD, _conf_warn = _env_float("YOLO_CONF_THRESHOLD", 0.5)
 # 빈값 = 워커가 torch.cuda.is_available() 자동감지 (GPU→cuda:0 / 없으면 CPU 폴백).
 YOLO_DEVICE: str = os.getenv("YOLO_DEVICE", "")
-# 추론 샘플 간격(초). 0.1=10fps — StreamManager/캡처 throttle (GPU 낭비 방지).
-# clamp [0.01,1.0]: 0/음수면 throttle 이 무력화돼 매 프레임 추론 → GPU 과부하. 상한 1.0(=1fps).
-_raw_inference_interval, _inference_warn = _env_float("INFERENCE_INTERVAL", 0.1)
-INFERENCE_INTERVAL: float = max(0.01, min(1.0, _raw_inference_interval))
-# detection WS 폴링 송출 간격(초). 영상은 WHEP, 이 WS 는 좌표 JSON 만.
-# clamp [0.01,1.0]: 0/음수면 asyncio.sleep(0) busy-loop, 너무 크면 좌표 갱신 지연.
-_raw_capture_interval, _capture_warn = _env_float("CAPTURE_INTERVAL", 0.03)
-CAPTURE_INTERVAL: float = max(0.01, min(1.0, _raw_capture_interval))
-# 단일 inference 워커의 지속 infer/s 예산. 활성 캠 수 N 으로 나눠 per-camera 제출 케이던스를
-# 자동 하향(interval=max(INFERENCE_INTERVAL, N/MAX_INFER_PER_SEC)) → 다수캠서도 워커 미포화.
-# clamp 하한 1.0: 0/음수면 interval=N/budget 가 음수/무한대라 케이던스 붕괴.
-_raw_max_infer, _max_infer_warn = _env_float("MAX_INFER_PER_SEC", 65.0)
-MAX_INFER_PER_SEC: float = max(1.0, _raw_max_infer)
+
+# rtsp-keypoint cadence autotune 정본. INFERENCE_INTERVAL은 telemetry 수렴 전 초기값이고,
+# MIN/MAX는 폭주 방지 경계다. CAPTURE_INTERVAL은 detection WS polling 주기다.
+MIN_INFERENCE_INTERVAL: float = 0.01
+MAX_INFERENCE_INTERVAL: float = 1.0
+INFERENCE_INTERVAL: float = 0.033
+CAPTURE_INTERVAL: float = 0.01
+
+# 실제 budget은 worker infer_ms EWMA에서 매초 계산한다. 이 값은 telemetry 표본이
+# 모이기 전 bootstrap 상한이며, source별 latest queue + micro-batch가 burst를 흡수한다.
+MAX_INFER_PER_SEC: float = 52.0
+AUTOTUNE_HEADROOM: float = 0.95
+AUTOTUNE_EWMA_ALPHA: float = 0.2
+AUTOTUNE_MIN_SAMPLES: int = 5
+AUTOTUNE_TARGET_FPS_MAX: float = MAX_INFER_PER_SEC
+
+# 모델별 worker pool + adaptive inference resolution 내부 정책.
+INFERENCE_BATCH_MAX: int = 8
+INFERENCE_BATCH_TIMEOUT_SEC: float = 0.008
+INFERENCE_AGGREGATE_TIMEOUT_SEC: float = 2.0
+INFERENCE_IMGSZ_STAGES: tuple[int, ...] = (320, 416, 512, 640)
+ADAPTIVE_DOWNSHIFT_TICKS: int = 2
+ADAPTIVE_UPSHIFT_TICKS: int = 5
+ADAPTIVE_OVERLOAD_RATIO: float = 0.85
+ADAPTIVE_UNDERLOAD_RATIO: float = 0.65
 
 # custom .pt 모델 디렉토리 — 미설정 시 backend/models(네이티브 dev) = /app/models(컨테이너)
 # 로 자동 결정(절대경로, cwd 무관). models_dir 가 import 시 CUSTOM_MODELS_DIR 를 읽으므로
@@ -141,15 +138,6 @@ logger = setup_logging()
 
 if _raw_max_ipcams != MAX_IPCAMS:
     logger.warning("MAX_IPCAMS=%d → %d 로 보정됨 (허용 범위: 1~64)", _raw_max_ipcams, MAX_IPCAMS)
-for _w in (_conf_warn, _inference_warn, _capture_warn, _max_infer_warn):
+for _w in (_conf_warn,):
     if _w:
         logger.warning("%s", _w)
-if _raw_inference_interval != INFERENCE_INTERVAL:
-    logger.warning("INFERENCE_INTERVAL=%.3f → %.3f 로 보정됨 (허용 범위: 0.01~1.0)",
-                   _raw_inference_interval, INFERENCE_INTERVAL)
-if _raw_capture_interval != CAPTURE_INTERVAL:
-    logger.warning("CAPTURE_INTERVAL=%.3f → %.3f 로 보정됨 (허용 범위: 0.01~1.0)",
-                   _raw_capture_interval, CAPTURE_INTERVAL)
-if _raw_max_infer != MAX_INFER_PER_SEC:
-    logger.warning("MAX_INFER_PER_SEC=%.1f → %.1f 로 보정됨 (허용 범위: >=1.0)",
-                   _raw_max_infer, MAX_INFER_PER_SEC)

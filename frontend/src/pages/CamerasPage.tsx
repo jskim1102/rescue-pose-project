@@ -1,10 +1,15 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { apiBase } from "../hooks/useApi";
 import CameraFormModal from "../components/CameraFormModal";
 import CameraGrid from "../components/CameraGrid";
 import SegmentedToggle from "../components/SegmentedToggle";
 import ModelManagerModal from "../components/ModelManagerModal";
 import ModelSettingsModal, { type ModelSettings } from "../components/ModelSettingsModal";
+import {
+  GpuUtilTargetUpdater,
+  normalizeGpuUtilConfig,
+  type GpuUtilConfigStatus,
+} from "../utils/gpuUtilControl";
 
 export interface Cam {
   id: number;
@@ -12,7 +17,6 @@ export interface Cam {
   rtsp_url: string;
   stream_key: string;
   created_at: string;
-  sync_pose?: boolean;
 }
 
 interface Stat {
@@ -22,8 +26,9 @@ interface Stat {
 
 const MAX_IPCAMS_FALLBACK = 16; // spec F4 — /api/config 로딩 전 기본값. 실제 cap 은 백엔드 env.
 const DEFAULT_CONF = 0.5; // deepeye 정본 (YOLO_CONF_THRESHOLD).
+const DEFAULT_GPU_UTIL_TARGET_PCT = 95;
 
-// 백엔드 실패 응답의 detail(예: 마스킹 *** 인 채 주소 변경 → 실비번 재입력 안내)을 추출.
+// 실패 응답에서 backend detail(비어있지 않은 문자열)만 노출, 없거나 비문자열·공백이면 fallback.
 // detail 은 <p>{error}</p> 로 렌더되므로 문자열 보장 필수 — 객체/배열 detail 렌더 크래시 차단.
 async function errorDetail(resp: Response, fallback: string): Promise<string> {
   // .catch(null) + ?. — 본문이 JSON `null` 이거나 파싱 실패여도 안전(널 역참조 크래시 차단).
@@ -44,8 +49,16 @@ export default function CamerasPage() {
   const [formOpen, setFormOpen] = useState(false);
   const [editCam, setEditCam] = useState<Cam | null>(null);
   const [error, setError] = useState("");
-  // RTSP-url 변경 성공 시에만 bump — CameraGrid 셀 remount 신호(이름-only 편집/실패 시 미remount).
+  // 카메라별 remount epoch — RTSP 변경 편집 성공 시 bump(→ CameraGrid key 변경 → 셀 remount).
+  // 응답 rtsp_url 은 마스킹(:***@)이라 비번-only 변경을 서버 응답으론 못 잡으므로 이 신호를 쓴다.
   const [playerEpoch, setPlayerEpoch] = useState<Record<number, number>>({});
+  const [gpuUtilTargetPct, setGpuUtilTargetPct] = useState(
+    DEFAULT_GPU_UTIL_TARGET_PCT
+  );
+  const [gpuUtilDutyPct, setGpuUtilDutyPct] = useState(0);
+  const gpuUtilInitializedRef = useRef(false);
+  const gpuUtilUserTouchedRef = useRef(false);
+  const gpuUtilUpdaterRef = useRef<GpuUtilTargetUpdater | null>(null);
 
   // ── detection 추론 컨트롤 (deepeye IpcamPage 차용, react-router 제외) ──
   // 카메라별 추론 ON/OFF.
@@ -80,6 +93,64 @@ export default function CamerasPage() {
       })
       .catch(() => {});
   }, []);
+
+  useEffect(() => {
+    const updater = new GpuUtilTargetUpdater({
+      endpoint: `${apiBase()}/api/inference/config`,
+      initialTarget: DEFAULT_GPU_UTIL_TARGET_PCT / 100,
+      onAccepted: (config) => {
+        setGpuUtilTargetPct(Math.round(config.gpu_util_target * 100));
+        setGpuUtilDutyPct(config.gpu_util_duty * 100);
+      },
+      onRejected: (lastTarget) => {
+        setError("GPU 사용률 설정을 저장하지 못했습니다.");
+        setGpuUtilTargetPct(Math.round(lastTarget * 100));
+      },
+    });
+    gpuUtilUpdaterRef.current = updater;
+    return () => {
+      updater.dispose();
+      gpuUtilUpdaterRef.current = null;
+    };
+  }, []);
+
+  // 모델 lane 전체의 실제 busy duty를 1초마다 표시한다. target은 최초 응답으로만
+  // 초기화해 polling이 사용자가 드래그 중인 slider를 덮어쓰지 않게 한다.
+  useEffect(() => {
+    let cancelled = false;
+    async function pollGpuUtil() {
+      try {
+        const response = await fetch(`${apiBase()}/api/inference/config`);
+        if (!response.ok) return;
+        const rawConfig = (await response.json()) as Partial<GpuUtilConfigStatus>;
+        if (cancelled) return;
+        const config = normalizeGpuUtilConfig(
+          rawConfig,
+          DEFAULT_GPU_UTIL_TARGET_PCT / 100
+        );
+        setGpuUtilDutyPct(config.gpu_util_duty * 100);
+        if (!gpuUtilInitializedRef.current) {
+          gpuUtilInitializedRef.current = true;
+          if (!gpuUtilUserTouchedRef.current) {
+            gpuUtilUpdaterRef.current?.acceptServerTarget(config.gpu_util_target);
+            setGpuUtilTargetPct(Math.round(config.gpu_util_target * 100));
+          }
+        }
+      } catch {
+        // 카메라/pose 화면은 GPU 상태 endpoint 일시 실패와 독립적으로 유지한다.
+      }
+    }
+    pollGpuUtil();
+    const timer = window.setInterval(pollGpuUtil, 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  useEffect(() => {
+    gpuUtilUpdaterRef.current?.schedule(gpuUtilTargetPct / 100);
+  }, [gpuUtilTargetPct]);
 
   // stats 1초 polling — 등록 카메라별 {active, readers} (mediamtx path 상태).
   useEffect(() => {
@@ -389,6 +460,35 @@ export default function CamerasPage() {
           })}
         </tbody>
       </table>
+
+      <section className="gpu-util-control" aria-labelledby="gpu-util-label">
+        <div className="gpu-util-copy">
+          <label id="gpu-util-label" htmlFor="gpu-util-target">
+            최대 GPU 사용 %
+          </label>
+          <p>카메라 수와 pose 모델 부하에 맞춰 keypoint FPS를 자동 배분합니다.</p>
+        </div>
+        <div className="gpu-util-slider">
+          <input
+            id="gpu-util-target"
+            type="range"
+            min="10"
+            max="95"
+            step="1"
+            value={gpuUtilTargetPct}
+            onChange={(event) => {
+              gpuUtilUserTouchedRef.current = true;
+              setError("");
+              setGpuUtilTargetPct(Number(event.target.value));
+            }}
+          />
+          <output htmlFor="gpu-util-target">{gpuUtilTargetPct}%</output>
+        </div>
+        <div className="gpu-util-duty" aria-live="polite">
+          <span>현재 측정</span>
+          <strong>{gpuUtilDutyPct.toFixed(0)}%</strong>
+        </div>
+      </section>
 
       <section className="live-section">
         <h2 className="grid-heading">실시간 그리드</h2>

@@ -1,3 +1,4 @@
+import threading
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -12,6 +13,15 @@ from app.mediamtx import sync_streams
 from app.streaming.manager import manager as stream_manager
 
 
+def _bg_sync() -> None:
+    """DB 카메라 재등록을 서버 시작과 분리해 백그라운드에서 수행한다."""
+    db = SessionLocal()
+    try:
+        sync_streams(db)
+    finally:
+        db.close()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """서버 시작/종료 시 리소스 관리."""
@@ -21,12 +31,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # YOLO 추론 워커 + dispatch 스레드 기동 (detection). preset-only — custom 모델 디렉토리 불필요.
     stream_manager.startup()
 
-    # DB 에 등록된 카메라를 mediamtx path 로 재등록 (재기동 후 복원).
-    db = SessionLocal()
-    try:
-        sync_streams(db)
-    finally:
-        db.close()
+    # DB 카메라 재등록은 카메라별 ffprobe 지연과 무관하게 서버가 즉시 요청을 받도록 분리한다.
+    # mediamtx 독립 재시작 뒤에는 stats 폴링의 ensure_stream 도 누락 path 를 자가복구한다.
+    threading.Thread(target=_bg_sync, daemon=True).start()
 
     logger.info("RTSP Detection API 서버 시작")
     yield

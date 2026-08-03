@@ -77,8 +77,8 @@ def test_create_returns_201_with_stream_key(client):
     body = resp.json()
     assert body["name"] == "정문"
     assert body["rtsp_url"] == "rtsp://x/1"
-    # stream_key 는 `ipcam-<hex>` 패턴 — 공유 mediamtx 면 MEDIAMTX_PATH_PREFIX 네임스페이싱이
-    # `<prefix>__ipcam-<hex>` 로 앞에 붙는다(운영 기본). prefix 유무에 견고하게 segment 로 검사.
+    # stream_key 는 `ipcam-<hex>` 패턴 — 기존 DB 호환/권한 경계용 MEDIAMTX_PATH_PREFIX가
+    # `<prefix>__ipcam-<hex>` 로 앞에 붙을 수 있으므로 prefix 유무에 견고하게 검사.
     assert "ipcam-" in body["stream_key"]
     assert "id" in body and "created_at" in body
 
@@ -90,61 +90,6 @@ def test_list_returns_created_cams_in_id_order(client):
     assert resp.status_code == 200
     names = [c["name"] for c in resp.json()]
     assert names == ["a", "b"]
-
-
-def test_list_marks_synced_pose_allowlist(client, monkeypatch):
-    import app.ipcam as ipcam_mod
-
-    cam1 = client.post("/api/ipcams", json={"name": "cam1", "rtsp_url": "rtsp://x/1"}).json()
-    cam2 = client.post("/api/ipcams", json={"name": "cam2", "rtsp_url": "rtsp://x/2"}).json()
-    monkeypatch.setattr(ipcam_mod, "SYNCED_POSE_STREAM_KEYS", {cam2["stream_key"]})
-    monkeypatch.setattr(ipcam_mod, "SYNCED_POSE_DISABLED_STREAM_KEYS", set())
-
-    body = client.get("/api/ipcams").json()
-
-    sync_by_key = {cam["stream_key"]: cam["sync_pose"] for cam in body}
-    assert sync_by_key[cam1["stream_key"]] is False
-    assert sync_by_key[cam2["stream_key"]] is True
-
-
-def test_list_auto_marks_direct_poe_sync_and_nvr_overlay(client, monkeypatch):
-    """RTSP URL 구조로 direct PoE 계열은 sync_pose, NVR realmonitor 계열은 기존 overlay."""
-    import app.ipcam as ipcam_mod
-
-    monkeypatch.setattr(ipcam_mod, "SYNCED_POSE_STREAM_KEYS", set())
-    monkeypatch.setattr(ipcam_mod, "SYNCED_POSE_DISABLED_STREAM_KEYS", set())
-    nvr = client.post(
-        "/api/ipcams",
-        json={
-            "name": "nvr",
-            "rtsp_url": "rtsp://admin:pw@192.168.0.113:554/cam/realmonitor?channel=2&subtype=0",
-        },
-    ).json()
-    poe = client.post(
-        "/api/ipcams",
-        json={"name": "poe", "rtsp_url": "rtsp://192.168.0.152:8554/camera01"},
-    ).json()
-
-    body = client.get("/api/ipcams").json()
-
-    sync_by_key = {cam["stream_key"]: cam["sync_pose"] for cam in body}
-    assert sync_by_key[nvr["stream_key"]] is False
-    assert sync_by_key[poe["stream_key"]] is True
-
-
-def test_list_sync_pose_disable_override_beats_auto(client, monkeypatch):
-    import app.ipcam as ipcam_mod
-
-    monkeypatch.setattr(ipcam_mod, "SYNCED_POSE_STREAM_KEYS", set())
-    cam = client.post(
-        "/api/ipcams",
-        json={"name": "poe", "rtsp_url": "rtsp://192.168.0.152:8554/camera01"},
-    ).json()
-    monkeypatch.setattr(ipcam_mod, "SYNCED_POSE_DISABLED_STREAM_KEYS", {cam["stream_key"]})
-
-    body = client.get("/api/ipcams").json()
-
-    assert {c["stream_key"]: c["sync_pose"] for c in body}[cam["stream_key"]] is False
 
 
 def test_update_changes_name_and_url(client):
@@ -180,79 +125,8 @@ def test_create_registers_mediamtx_path(client, mtx):
     mtx["register"].assert_called_once_with(cam["stream_key"], "rtsp://x/c")
 
 
-def test_detection_ws_captures_from_mediamtx_fanout(client, monkeypatch):
-    """좌표 WS 는 원본 RTSP 재접속 대신 mediamtx path RTSP 를 읽어 WHEP 영상과 시간축을 맞춘다."""
-    from app import ipcam as ipcam_mod
-
-    stream_key = "rescue_pose__ipcam-test"
-    cam = SimpleNamespace(stream_key=stream_key, rtsp_url="rtsp://camera/raw")
-    replaces = []
-    starts = []
-    stops = []
-
-    class FakeQuery:
-        def filter(self, *args, **kwargs):
-            return self
-
-        def first(self):
-            return cam
-
-    class FakeDb:
-        def query(self, model):
-            return FakeQuery()
-
-        def close(self):
-            return None
-
-    class FakeStreamManager:
-        def set_source_annotated_frame(self, sid, enabled):
-            return None
-
-        def replace_source(self, sid, source):
-            replaces.append((sid, source))
-            return True
-
-        def start_capture(self, sid, source):
-            starts.append((sid, source))
-            return True
-
-        def get_source_latest_detections(self, sid):
-            return None
-
-        def stop_capture(self, sid):
-            stops.append(sid)
-
-    monkeypatch.setattr(ipcam_mod, "stream_manager", FakeStreamManager())
-    monkeypatch.setattr(ipcam_mod, "MEDIAMTX_DETECTION_FANOUT_STREAM_KEYS", {stream_key})
-    monkeypatch.setattr("app.database.SessionLocal", lambda: FakeDb())
-    monkeypatch.setattr(
-        ipcam_mod,
-        "stream_rtsp_url",
-        lambda stream_key: f"rtsp://backend:s3cret@mtx.local:8554/{stream_key}",
-    )
-
-    with client.websocket_connect(f"/api/ipcams/{stream_key}/ws"):
-        deadline = time.monotonic() + 1.0
-        while not starts and time.monotonic() < deadline:
-            time.sleep(0.01)
-
-    assert replaces == [
-        (
-            f"ipcam-{stream_key}",
-            f"rtsp://backend:s3cret@mtx.local:8554/{stream_key}",
-        )
-    ]
-    assert starts == [
-        (
-            f"ipcam-{stream_key}",
-            f"rtsp://backend:s3cret@mtx.local:8554/{stream_key}",
-        )
-    ]
-    assert stops == [f"ipcam-{stream_key}"]
-
-
 def test_detection_ws_defaults_to_camera_rtsp(client, monkeypatch):
-    """fan-out allowlist 에 없는 카메라는 원본 RTSP direct 캡처를 유지한다(NVR 지연 회귀 방지)."""
+    """rtsp-keypoint 정본처럼 detection WS는 카메라 RTSP를 직접 캡처한다."""
     from app import ipcam as ipcam_mod
 
     stream_key = "rescue_pose__ipcam-nvr"
@@ -274,9 +148,6 @@ def test_detection_ws_defaults_to_camera_rtsp(client, monkeypatch):
             return None
 
     class FakeStreamManager:
-        def set_source_annotated_frame(self, sid, enabled):
-            return None
-
         def replace_source(self, sid, source):
             starts.append(("replace", sid, source))
             return True
@@ -292,7 +163,6 @@ def test_detection_ws_defaults_to_camera_rtsp(client, monkeypatch):
             return None
 
     monkeypatch.setattr(ipcam_mod, "stream_manager", FakeStreamManager())
-    monkeypatch.setattr(ipcam_mod, "MEDIAMTX_DETECTION_FANOUT_STREAM_KEYS", set())
     monkeypatch.setattr("app.database.SessionLocal", lambda: FakeDb())
 
     with client.websocket_connect(f"/api/ipcams/{stream_key}/ws"):
@@ -300,8 +170,7 @@ def test_detection_ws_defaults_to_camera_rtsp(client, monkeypatch):
         while not starts and time.monotonic() < deadline:
             time.sleep(0.01)
 
-    assert starts[:2] == [
-        ("replace", f"ipcam-{stream_key}", "rtsp://nvr/cam1"),
+    assert starts == [
         ("start", f"ipcam-{stream_key}", "rtsp://nvr/cam1"),
     ]
 
@@ -747,24 +616,6 @@ def test_update_rtsp_change_replaces_inference_capture(client, mtx):
         )
     assert resp.status_code == 200
     sm.replace_source.assert_called_once_with(f"ipcam-{cam['stream_key']}", "rtsp://x/new")
-
-
-def test_update_rtsp_change_replaces_fanout_capture_when_allowlisted(client, mtx, monkeypatch):
-    """fan-out allowlist 카메라만 URL 변경 후 mediamtx fan-out 캡처를 유지한다."""
-    import app.ipcam as ipcam_mod
-
-    cam = client.post("/api/ipcams", json={"name": "u", "rtsp_url": "rtsp://x/old"}).json()
-    monkeypatch.setattr(ipcam_mod, "MEDIAMTX_DETECTION_FANOUT_STREAM_KEYS", {cam["stream_key"]})
-    with patch("app.ipcam.stream_manager") as sm, \
-         patch("app.ipcam.stream_rtsp_url", return_value="rtsp://backend:s3cret@mtx.local:8554/path"):
-        resp = client.put(
-            f"/api/ipcams/{cam['id']}", json={"name": "u", "rtsp_url": "rtsp://x/new"}
-        )
-    assert resp.status_code == 200
-    sm.replace_source.assert_called_once_with(
-        f"ipcam-{cam['stream_key']}",
-        "rtsp://backend:s3cret@mtx.local:8554/path",
-    )
 
 
 def test_update_no_rtsp_change_does_not_replace_capture(client, mtx):

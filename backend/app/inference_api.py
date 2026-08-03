@@ -18,12 +18,15 @@ class InferenceConfig(BaseModel):
     model: str
     conf_threshold: float
     device: str
+    gpu_util_target: float
+    gpu_util_duty: float
 
 
 class InferenceConfigUpdate(BaseModel):
     enabled: bool | None = None
     model: str | None = None
     conf_threshold: float | None = None
+    gpu_util_target: float | None = None
 
 
 inference_router = APIRouter(prefix="/api/inference", tags=["inference"])
@@ -44,6 +47,8 @@ def update_inference_config(body: InferenceConfigUpdate) -> dict:
         stream_manager.set_inference_model(body.model)
     if body.conf_threshold is not None:
         stream_manager.set_inference_conf_threshold(body.conf_threshold)
+    if body.gpu_util_target is not None:
+        stream_manager.set_gpu_util_target(body.gpu_util_target)
     return stream_manager.get_inference_config()
 
 

@@ -1,21 +1,17 @@
-const API_PORT = import.meta.env.VITE_API_PORT || "8000";
-const WEBRTC_PORT = import.meta.env.VITE_MEDIAMTX_WEBRTC_PORT || "8889";
+const API_PORT = import.meta.env.VITE_API_PORT;
+const WEBRTC_PORT = import.meta.env.VITE_MEDIAMTX_WEBRTC_PORT;
 // mediamtx 인증(#100) — 외부 브라우저 WHEP 시청용 viewer 자격증명(빌드타임 인라인).
 const VIEWER_USER = import.meta.env.VITE_MEDIAMTX_VIEWER_USER || "";
 const VIEWER_PASS = import.meta.env.VITE_MEDIAMTX_VIEWER_PASS || "";
-const SYNCED_POSE_STREAM_KEYS = new Set(
-  (import.meta.env.VITE_SYNCED_POSE_STREAM_KEYS || "")
-    .split(",")
-    .map((key: string) => key.trim())
-    .filter(Boolean),
-);
 
 export function apiBase(): string {
+  if (!API_PORT) throw new Error("VITE_API_PORT is required");
   return `http://${window.location.hostname}:${API_PORT}`;
 }
 
 // mediamtx WHEP endpoint base — 브라우저가 mediamtx 에 직접 접속(백엔드 경유 X).
 export function whepBase(): string {
+  if (!WEBRTC_PORT) throw new Error("VITE_MEDIAMTX_WEBRTC_PORT is required");
   return `http://${window.location.hostname}:${WEBRTC_PORT}`;
 }
 
@@ -23,8 +19,4 @@ export function whepBase(): string {
 export function whepAuthHeaders(): Record<string, string> {
   if (!VIEWER_PASS) return {};
   return { Authorization: "Basic " + btoa(`${VIEWER_USER}:${VIEWER_PASS}`) };
-}
-
-export function isSyncedPoseStream(streamKey: string): boolean {
-  return SYNCED_POSE_STREAM_KEYS.has(streamKey);
 }

@@ -11,8 +11,8 @@ from app.database import Base
 def _generate_stream_key() -> str:
     """등록용 고유 스트림 키 생성.
 
-    공유 mediamtx 사용 시 MEDIAMTX_PATH_PREFIX 로 path 네임스페이싱 → `<prefix>__ipcam-<hex>`
-    (프로젝트간 path 충돌·교차열람 차단). 미설정(단독 mediamtx)이면 `ipcam-<hex>` (하위호환).
+    MEDIAMTX_PATH_PREFIX 로 path 네임스페이싱 → `<prefix>__ipcam-<hex>`.
+    self-host 전환 뒤에도 기존 DB 키 호환과 viewer path 권한 경계를 위해 prefix 를 유지한다.
     mediamtx.py/transcode($MTX_PATH)/WHEP 는 stream_key 를 그대로 쓰므로 자동 네임스페이싱된다.
     """
     suffix = f"ipcam-{uuid.uuid4().hex[:8]}"

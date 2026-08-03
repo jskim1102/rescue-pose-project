@@ -1,4 +1,4 @@
-"""codex #6 회귀 잠금 — 비숫자 YOLO_CONF_THRESHOLD 로 import 크래시하지 않는다.
+"""회귀 잠금 — 비숫자 YOLO_CONF_THRESHOLD 로 import 크래시하지 않는다.
 
 이전(fix6 전)엔 worker.py 가 `float(os.getenv("YOLO_CONF_THRESHOLD"))` 를 직접 호출해
 값이 숫자가 아니면 import 시점에 ValueError 로 죽었다. 지금은 config.YOLO_CONF_THRESHOLD

@@ -4,6 +4,7 @@ import WhepPlayer from "../components/WhepPlayer";
 import KeypointOverlay from "../components/KeypointOverlay";
 import { useDetectionWs } from "../hooks/useDetectionWs";
 import { apiBase } from "../hooks/useApi";
+import { useCameraRegistry } from "../hooks/useCameraRegistry";
 import {
   type PatientEpisodeMap,
   ensurePatientEpisodeId,
@@ -104,13 +105,6 @@ function fmtClock(d: Date): string {
 
 // ── 실데이터: ipcam 라이브 프레임 ────────────────────────────────────
 
-interface IpCam {
-  id: number;
-  name: string;
-  stream_key: string;
-  sync_pose?: boolean;
-}
-
 // CAM 슬롯 label — 위치 기반 `CAM 01`… (등록 순서). reportBySlot 집계 키이자 React key.
 function camLabel(i: number): string {
   return `CAM ${String(i + 1).padStart(2, "0")}`;
@@ -124,15 +118,11 @@ function camLabel(i: number): string {
 function CamLiveView({
   streamKey,
   label,
-  syncPose,
   onReport,
-  onRescueEnd,
 }: {
   streamKey: string;
   label: string;
-  syncPose: boolean;
   onReport: (label: string, r: CamReport) => void;
-  onRescueEnd: (label: string, reasons: string[]) => void;
 }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const [detectionActive, setDetectionActive] = useState(false);
@@ -182,19 +172,9 @@ function CamLiveView({
       cancelled = true;
     };
   }, [streamKey]);
-  const handleEvents = useCallback((reasons: string[]) => onRescueEnd(label, reasons), [label, onRescueEnd]);
-  const { items, frameW, frameH, captureTs, detFps, annotatedFrame } = useDetectionWs(
-    streamKey,
-    detectionActive,
-    handleEvents,
-  );
-  const syncedPose = detectionActive && syncPose;
+  const { items, frameW, frameH } = useDetectionWs(streamKey, detectionActive);
   const [live, setLive] = useState(false);
   const onFps = useCallback((f: number) => setLive(f > 0), []);
-
-  useEffect(() => {
-    if (syncedPose) setLive(detFps > 0);
-  }, [syncedPose, detFps]);
 
   // 실 집계 — 이 카메라 detections 의 posture 카운트 + rescue 대상 리스트를 부모(대시보드)로 올린다.
   // people = 감지된 사람 수(posture 무관), sitting/lying = 해당 posture 인원, rescue = 판정 대상.
@@ -235,40 +215,43 @@ function CamLiveView({
         </span>
       </div>
       <div style={s.camBody}>
-        {syncedPose ? (
-          annotatedFrame ? (
-            <img src={annotatedFrame} alt="" style={s.syncedFrame} />
-          ) : (
-            <span style={s.camPlaceholder}>동기화 대기</span>
-          )
-        ) : (
-          <>
-            <WhepPlayer streamKey={streamKey} videoRef={videoRef} onFps={onFps} />
-            <KeypointOverlay
-              videoRef={videoRef}
-              detections={items}
-              captureTs={captureTs}
-              frameW={frameW}
-              frameH={frameH}
-            />
-          </>
-        )}
+        <WhepPlayer streamKey={streamKey} videoRef={videoRef} onFps={onFps} />
+        <KeypointOverlay
+          videoRef={videoRef}
+          detections={items}
+          frameW={frameW}
+          frameH={frameH}
+        />
       </div>
     </div>
   );
 }
 
-/** 카메라 미등록/백엔드 없음 슬롯 플레이스홀더. */
-function CamPlaceholder({ label }: { label: string }) {
+/** 카메라 목록 상태별 슬롯 플레이스홀더. */
+function CamPlaceholder({
+  label,
+  status,
+}: {
+  label: string;
+  status: "loading" | "empty" | "error";
+}) {
+  const statusLabel =
+    status === "loading" ? "● 확인 중" : status === "error" ? "● 연결 오류" : "● 미등록";
+  const message =
+    status === "loading"
+      ? "카메라 목록 불러오는 중…"
+      : status === "error"
+        ? "카메라 목록을 불러오지 못했습니다"
+        : "등록된 카메라 없음 — 설정에서 RTSP 추가";
   return (
     <div style={s.camCard}>
       <div style={s.camHeader}>
         <span style={s.camLabel}>{label}</span>
-        <span style={{ ...s.liveTag, color: C.muted }}>● 미등록</span>
+        <span style={{ ...s.liveTag, color: status === "error" ? C.amber : C.muted }}>
+          {statusLabel}
+        </span>
       </div>
-      <div style={{ ...s.camBody, ...s.camPlaceholder }}>
-        등록된 카메라 없음 — 설정에서 RTSP 추가
-      </div>
+      <div style={{ ...s.camBody, ...s.camPlaceholder }}>{message}</div>
     </div>
   );
 }
@@ -276,7 +259,7 @@ function CamPlaceholder({ label }: { label: string }) {
 // ── 메인 대시보드 ────────────────────────────────────────────────────
 
 function DashboardPage() {
-  const [cams, setCams] = useState<IpCam[]>([]);
+  const { cameras: cams, status: camsStatus } = useCameraRegistry();
   const [now, setNow] = useState(new Date());
   // 카메라별 집계 — CamLiveView 가 onReport 로 올린 값을 슬롯 label 별로 저장.
   const [reportBySlot, setReportBySlot] = useState<Record<string, CamReport>>({});
@@ -293,12 +276,6 @@ function DashboardPage() {
     setReportBySlot((prev) => ({ ...prev, [label]: r }));
   }, []);
 
-  // rescue 종료 이벤트는 프론트 즉시 전이 감지에서 처리한다. backend 이벤트는 중복 방지용으로 소비만 한다.
-  const handleRescueEnd = useCallback((label: string, reasons: string[]) => {
-    void label;
-    void reasons;
-  }, []);
-
   // 이벤트 로그(실데이터) — raw 자세 변화가 아니라 카메라별 구조 사건 타임라인만 기록한다.
   const [events, setEvents] = useState<EventRow[]>([]);
   const [page, setPage] = useState(0);
@@ -313,14 +290,6 @@ function DashboardPage() {
     }
     return getPatientEpisodeId(patientEpisodesRef.current, label, nowMs) ?? "—";
   };
-
-  // 등록된 ipcam fetch (실데이터). 백엔드 없으면 빈 배열(gate-2 = graceful).
-  useEffect(() => {
-    fetch(`${apiBase()}/api/ipcams`)
-      .then((r) => r.json())
-      .then((data: IpCam[]) => setCams(data))
-      .catch(() => setCams([]));
-  }, []);
 
   // 실시간 시계
   useEffect(() => {
@@ -371,6 +340,7 @@ function DashboardPage() {
   // 카메라 뷰 = 항상 2분할(2열). 등록 0/1/2개 무관 최소 2슬롯 유지 — 빈 슬롯은 CamPlaceholder.
   // cams 가 3개+ 여도 2열 고정(여러 행). 실 카메라만 CamLiveView(WS/rescue), 나머지는 자리표시.
   const camSlots = Math.max(2, cams.length);
+  const placeholderStatus = camsStatus === "ready" ? "empty" : camsStatus;
 
   // 이벤트 로그 페이지네이션 — 페이지당 PAGE_SIZE, page 는 저장범위 초과 시 clamp.
   const evtPages = Math.max(1, Math.ceil(events.length / PAGE_SIZE));
@@ -461,12 +431,10 @@ function DashboardPage() {
                   key={label}
                   streamKey={cam.stream_key}
                   label={label}
-                  syncPose={cam.sync_pose === true}
                   onReport={reportCam}
-                  onRescueEnd={handleRescueEnd}
                 />
               ) : (
-                <CamPlaceholder key={`ph-${i}`} label={label} />
+                <CamPlaceholder key={`ph-${i}`} label={label} status={placeholderStatus} />
               );
             })}
           </div>
@@ -675,7 +643,6 @@ const s: Record<string, React.CSSProperties> = {
   camLabel: { fontSize: "0.85rem", fontWeight: 600 },
   liveTag: { fontSize: "0.75rem", fontWeight: 700 },
   camBody: { position: "relative", aspectRatio: "16 / 9", maxHeight: "var(--rp-cam-body-max-h)", background: "#000", display: "flex", alignItems: "center", justifyContent: "center" },
-  syncedFrame: { position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "contain" as const },
   camPlaceholder: { color: C.muted, fontSize: "0.85rem" },
 
   // 공용 패널

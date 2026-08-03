@@ -1,24 +1,17 @@
 import asyncio
 import logging
 from datetime import datetime
-from urllib.parse import unquote, urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel, computed_field, field_serializer
+from pydantic import BaseModel, field_serializer
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.config import (
-    CAPTURE_INTERVAL,
-    MAX_IPCAMS,
-    MEDIAMTX_DETECTION_FANOUT_STREAM_KEYS,
-    SYNCED_POSE_DISABLED_STREAM_KEYS,
-    SYNCED_POSE_STREAM_KEYS,
-)
+from app.config import CAPTURE_INTERVAL, MAX_IPCAMS
 from app.database import get_db
 from app.masking import _MASK, _restore_masked_password, _split_credentials, mask_rtsp_credentials
 from app.mediamtx import ensure_stream, register_stream, remove_stream, update_stream
-from app.mediamtx import _validate_rtsp_url, stream_rtsp_url
+from app.mediamtx import _validate_rtsp_url
 from app.models import IpCam
 from app.streaming.manager import detections_to_json
 from app.streaming.manager import manager as stream_manager
@@ -31,58 +24,6 @@ router = APIRouter(prefix="/api/ipcams", tags=["ipcam"])
 def _source_id(stream_key: str) -> str:
     """ipcam-<stream_key> 형식의 source_id (추론 캡처 식별자)."""
     return f"ipcam-{stream_key}"
-
-
-_NVR_RTSP_MARKERS = (
-    "realmonitor",
-    "channel=",
-    "subtype=",
-    "/streaming/channels",
-    "/isapi/",
-)
-_DIRECT_CAMERA_PATH_PREFIXES = (
-    "camera",
-)
-
-
-def _looks_like_nvr_rtsp(rtsp_url: str) -> bool:
-    folded = unquote(rtsp_url).lower()
-    return any(marker in folded for marker in _NVR_RTSP_MARKERS)
-
-
-def _looks_like_direct_camera_rtsp(rtsp_url: str) -> bool:
-    """NVR이 아닌 direct camera/PoE 계열로 보이는 RTSP URL 휴리스틱."""
-    if _looks_like_nvr_rtsp(rtsp_url):
-        return False
-    parsed = urlsplit(rtsp_url)
-    path = unquote(parsed.path or "").strip("/").lower()
-    if not path:
-        return False
-    first_segment = path.split("/", 1)[0]
-    return any(first_segment.startswith(prefix) for prefix in _DIRECT_CAMERA_PATH_PREFIXES)
-
-
-def _should_sync_pose(stream_key: str, rtsp_url: str) -> bool:
-    """cam별 동기화 표시 여부.
-
-    우선순위: disabled override > enabled override > NVR/direct URL 자동분류.
-    """
-    if stream_key in SYNCED_POSE_DISABLED_STREAM_KEYS:
-        return False
-    if stream_key in SYNCED_POSE_STREAM_KEYS:
-        return True
-    return _looks_like_direct_camera_rtsp(rtsp_url)
-
-
-def _detection_capture_source(stream_key: str, rtsp_url: str) -> str:
-    """이 카메라의 detection 캡처 source.
-
-    기본은 원본 RTSP 직접 캡처다. mediamtx fan-out 은 지정된 stream_key 에만 적용한다.
-    NVR처럼 mediamtx path 에서 transcode 를 타는 카메라는 fan-out 이 오히려 좌표 지연을 만든다.
-    """
-    if stream_key in MEDIAMTX_DETECTION_FANOUT_STREAM_KEYS or _should_sync_pose(stream_key, rtsp_url):
-        return stream_rtsp_url(stream_key)
-    return rtsp_url
 
 
 def _check_rtsp_url(rtsp_url: str) -> None:
@@ -178,11 +119,6 @@ class IpCamResponse(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
-
-    @computed_field
-    @property
-    def sync_pose(self) -> bool:
-        return _should_sync_pose(self.stream_key, self.rtsp_url)
 
     @field_serializer("rtsp_url")
     def _mask_url(self, v: str) -> str:
@@ -281,11 +217,7 @@ def update_ipcam(cam_id: int, body: IpCamUpdate, db: Session = Depends(get_db)) 
 
     # 추론 캡처를 새 RTSP 로 교체 — 스트리밍 중 편집해도 검출이 새 카메라를 따라감(옛 source 잔존 X, F1).
     if new_url != old_url:
-        stream_manager.set_source_annotated_frame(
-            _source_id(cam.stream_key),
-            _should_sync_pose(cam.stream_key, new_url),
-        )
-        stream_manager.replace_source(_source_id(cam.stream_key), _detection_capture_source(cam.stream_key, new_url))
+        stream_manager.replace_source(_source_id(cam.stream_key), new_url)
 
     logger.info("IP CAM 수정: id=%d name=%s", cam.id, cam.name)
     return cam
@@ -405,69 +337,6 @@ def set_ipcam_inference(stream_key: str, body: PerSourceInferenceUpdate) -> dict
     return _build_inference_state(sid)
 
 
-# ─── [DEMO-ONLY 임시] 합성 detection 주입 — 실 카메라/사람 없이 프론트 렌더 확인용 ───
-def _demo_person(posture: str):
-    from app.inference.worker import Detection
-
-    C = 0.9
-    # 앉은 자세 COCO17 keypoints (torso 수직=非lying, 다리 꺾임=sitting 판정 검증됨)
-    kp = [
-        (100, 80, C), (97, 76, C), (103, 76, C), (93, 78, C), (107, 78, C),
-        (90, 100, C), (110, 100, C), (85, 140, C), (115, 140, C), (83, 175, C), (117, 175, C),
-        (92, 200, C), (108, 200, C), (85, 255, C), (115, 255, C), (95, 250, C), (105, 250, C),
-    ]
-    return Detection(
-        class_id=0, class_name="person", confidence=C,
-        keypoints=[(float(x), float(y), float(c)) for (x, y, c) in kp],
-        model="pose", posture=posture,
-    )
-
-
-@router.post("/{stream_key}/_demo")
-def demo_inject(stream_key: str, posture: str = "sitting", count: int = 1) -> dict:
-    """[DEMO-ONLY 임시] 이 카메라에 합성 사람 detection 주입(프론트 오버레이/스탯 확인용)."""
-    from app.inference.worker import InferenceResult
-
-    sid = _source_id(stream_key)
-    dets = [_demo_person(posture) for _ in range(max(1, count))]
-    res = InferenceResult(source_id=sid, timestamp=0.0, detections=dets, frame_w=640, frame_h=480)
-    stream_manager.set_demo_detection(sid, res)
-    return {"injected": True, "posture": posture, "count": len(dets)}
-
-
-@router.delete("/{stream_key}/_demo")
-def demo_clear(stream_key: str) -> dict:
-    """[DEMO-ONLY 임시] 합성 detection 해제."""
-    stream_manager.set_demo_detection(_source_id(stream_key), None)
-    return {"cleared": True}
-
-
-@router.post("/{stream_key}/_demo_event")
-def demo_event(stream_key: str, reason: str = "lost") -> dict:
-    """[DEMO-ONLY 임시] rescue 종료 이벤트(recovered/lost) 버퍼에 주입 → 다음 WS 송출이 동봉."""
-    sid = _source_id(stream_key)
-    with stream_manager._rescue_lock:
-        stream_manager._rescue_end_events.setdefault(sid, []).append(reason)
-    return {"queued": reason, "sid": sid, "buf": stream_manager._rescue_end_events.get(sid)}
-
-
-@router.get("/{stream_key}/_demo_event")
-def demo_event_peek(stream_key: str) -> dict:
-    """[DEMO-ONLY 임시] drain_rescue_events 직접 호출 테스트."""
-    import app.streaming.manager as mgr_mod
-    sid = _source_id(stream_key)
-    det = stream_manager.get_source_latest_detections(sid)
-    out = detections_to_json(det) if det else "{}"
-    import json as _json
-    parsed = _json.loads(out)
-    return {
-        "sid": sid,
-        "same_instance": stream_manager is mgr_mod.manager,
-        "json_has_rescueEvents": "rescueEvents" in parsed,
-        "json_rescueEvents": parsed.get("rescueEvents"),
-    }
-
-
 @router.websocket("/{stream_key}/ws")
 async def ipcam_ws(websocket: WebSocket, stream_key: str) -> None:
     """detection 좌표 JSON WebSocket (슬림 — JPEG/binary 없음).
@@ -503,34 +372,13 @@ async def ipcam_ws(websocket: WebSocket, stream_key: str) -> None:
         return
 
     # rtsp_url 은 비번 포함 → 로그엔 마스킹값만 (평문 자격증명 누수 차단, P1).
-    detection_source = _detection_capture_source(stream_key, cam.rtsp_url)
-    stream_manager.set_source_annotated_frame(sid, _should_sync_pose(stream_key, cam.rtsp_url))
-    logger.info(
-        "detection WS 연결: %s (rtsp=%s, capture=%s)",
-        sid,
-        mask_rtsp_credentials(cam.rtsp_url),
-        mask_rtsp_credentials(detection_source),
-    )
+    logger.info("detection WS 연결: %s (rtsp=%s)", sid, mask_rtsp_credentials(cam.rtsp_url))
 
-    # 기본은 원본 RTSP 직접 캡처다. 지정된 카메라만 mediamtx fan-out 을 읽는다.
-    # 원본 카메라에 WHEP용 ffmpeg + detection용 OpenCV 두 클라이언트가 따로 붙으면 일부 PoE/중계
-    # RTSP 서버에서 detection 프레임만 뒤처질 수 있지만, NVR처럼 fan-out 이 transcode 를 타면 반대로
-    # fan-out 쪽이 느려질 수 있어 전역 적용하면 안 된다.
-    stream_manager.replace_source(sid, detection_source)
-    if not stream_manager.start_capture(sid, detection_source):
-        if detection_source != cam.rtsp_url:
-            logger.warning("Capture %s fan-out 시작 실패 — 원본 RTSP fallback 시도", sid)
-            stream_manager.replace_source(sid, cam.rtsp_url)
-            if stream_manager.start_capture(sid, cam.rtsp_url):
-                detection_source = cam.rtsp_url
-            else:
-                logger.warning("Capture %s 시작 실패 — RTSP 연결 안 됨", sid)
-                await websocket.close(code=1011, reason="RTSP 연결 실패")
-                return
-        else:
-            logger.warning("Capture %s 시작 실패 — RTSP 연결 안 됨", sid)
-            await websocket.close(code=1011, reason="RTSP 연결 실패")
-            return
+    # rtsp-keypoint 정본: backend가 원본 RTSP를 직접 디코드해 worker pool에 제출한다.
+    if not stream_manager.start_capture(sid, cam.rtsp_url):
+        logger.warning("Capture %s 시작 실패 — RTSP 연결 안 됨", sid)
+        await websocket.close(code=1011, reason="RTSP 연결 실패")
+        return
 
     try:
         prev_det_ts: float = 0.0

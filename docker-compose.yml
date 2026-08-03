@@ -1,4 +1,4 @@
-# rescue-pose — 2컨테이너(backend + frontend) + 공유 mediamtx(harness-shared-mediamtx, 외부망, CEO #115)
+# rescue-pose — standalone 3컨테이너(backend + frontend + mediamtx)
 # base=rtsp-keypoint(영상=WHEP + YOLO pose 추론) + 자세분류/구조판단(rescue seam).
 #
 # 실행:   docker compose up --build                                  (CPU/auto)
@@ -21,35 +21,29 @@ services:
       DATABASE_URL: sqlite:////app/data/ipcam.db
       # config.py 가 읽는 등록 cap. 비우면 config 기본 16.
       MAX_IPCAMS: ${MAX_IPCAMS:-16}
-      # 공유 mediamtx API — docker DNS(harness-shared-mtx 망의 서비스명). path 등록/삭제/조회 (CEO #115).
-      MEDIAMTX_API: http://harness-shared-mediamtx:9997
+      # 프로젝트 전용 mediamtx API — compose 내부 DNS. path 등록/삭제/조회.
+      MEDIAMTX_API: ${MEDIAMTX_API:-http://mediamtx:9997}
       # Detection 캡처는 WHEP 영상과 같은 mediamtx fan-out RTSP 를 읽어 시간축 차이를 줄인다.
-      MEDIAMTX_RTSP_BASE_URL: rtsp://harness-shared-mediamtx:8554
-      # fan-out 은 allowlist 카메라에만 적용한다. 기본은 원본 RTSP direct 캡처.
-      MEDIAMTX_DETECTION_FANOUT_STREAM_KEYS: ${MEDIAMTX_DETECTION_FANOUT_STREAM_KEYS:-}
-      # 같은 추론 프레임에 keypoint 를 그린 JPEG 표시 allowlist. cam2 같은 문제 카메라만 지정.
-      SYNCED_POSE_STREAM_KEYS: ${SYNCED_POSE_STREAM_KEYS:-}
-      # 자동 direct-camera 판정이 틀린 카메라를 sync_pose 에서 제외할 때 지정.
-      SYNCED_POSE_DISABLED_STREAM_KEYS: ${SYNCED_POSE_DISABLED_STREAM_KEYS:-}
-      # path 네임스페이스 prefix — stream_key 가 `rescue_pose__ipcam-*` 로 생성(프로젝트간 교차열람 차단).
-      MEDIAMTX_PATH_PREFIX: rescue_pose
-      # 공유 mediamtx 인증 — backend user(공유 비번). API/publish/read.
-      MEDIAMTX_BACKEND_USER: backend
+      MEDIAMTX_RTSP_BASE_URL: ${MEDIAMTX_RTSP_BASE_URL:-rtsp://mediamtx:8554}
+      # 기존 DB stream_key 호환 + viewer path 권한 경계.
+      MEDIAMTX_PATH_PREFIX: ${MEDIAMTX_PATH_PREFIX:-rescue_pose}
+      # 프로젝트 전용 mediamtx 인증 — backend user. API/publish/read.
+      MEDIAMTX_BACKEND_USER: ${MEDIAMTX_BACKEND_USER:-backend}
       MEDIAMTX_BACKEND_PASS: ${MEDIAMTX_BACKEND_PASS:?set MEDIAMTX_BACKEND_PASS in .env}
       # ── detection (YOLO 추론) — .env 값 전달(dev/docker 파리티 RULES §5.5). 빈값/미설정이면 config 기본.
       YOLO_DEFAULT_MODEL: ${YOLO_DEFAULT_MODEL:-yolo26n-pose.pt}
       YOLO_CONF_THRESHOLD: ${YOLO_CONF_THRESHOLD:-0.5}
       # YOLO_DEVICE 빈값 = 워커 자동감지(GPU→cuda:0/없으면 CPU). gpu override 가 cuda:0 강제.
       YOLO_DEVICE: ${YOLO_DEVICE:-}
-      INFERENCE_INTERVAL: ${INFERENCE_INTERVAL:-0.1}
-      CAPTURE_INTERVAL: ${CAPTURE_INTERVAL:-0.03}
     ports:
       - "${BACKEND_PORT:?set BACKEND_PORT in .env}:8000"
     volumes:
       # SQLite DB 영속화 — named volume (원본 bind-mount `touch deepeye.db` 트랩 회피).
       - ipcam_db:/app/data
     networks:
-      - harness-shared-mtx
+      - rescue-pose
+    depends_on:
+      - mediamtx
     restart: unless-stopped
 
   # ─────────────────────────────── Frontend ──────────────────────────────
@@ -62,10 +56,9 @@ services:
         VITE_API_PORT: "${BACKEND_PORT}"
         # WHEP 접속 포트 (mediamtx webrtc, 호스트 노출 포트).
         VITE_MEDIAMTX_WEBRTC_PORT: "${MEDIAMTX_WEBRTC_PORT}"
-        # WHEP 인증 — 브라우저가 이 프로젝트 viewer 자격증명으로 공유 mediamtx read (빌드타임 인라인).
-        VITE_MEDIAMTX_VIEWER_USER: "viewer_rescue_pose"
+        # WHEP 인증 — 브라우저가 이 프로젝트 viewer 자격증명으로 전용 mediamtx read (빌드타임 인라인).
+        VITE_MEDIAMTX_VIEWER_USER: "${MEDIAMTX_VIEWER_USER:-viewer_rescue_pose}"
         VITE_MEDIAMTX_VIEWER_PASS: "${MEDIAMTX_VIEWER_PASS:?set MEDIAMTX_VIEWER_PASS in .env}"
-        VITE_SYNCED_POSE_STREAM_KEYS: "${VITE_SYNCED_POSE_STREAM_KEYS:-}"
     image: rescue-pose-frontend:dev
     container_name: rescue-pose-frontend
     ports:
@@ -75,11 +68,40 @@ services:
       - backend
     restart: unless-stopped
 
+  # ────────────────────────────── MediaMTX ──────────────────────────────
+  mediamtx:
+    image: bluenviron/mediamtx:1.19.1-ffmpeg
+    container_name: rescue-pose-mediamtx
+    environment:
+      # 외부 WHEP 연결에 광고할 LAN/공인 IP.
+      MTX_WEBRTCADDITIONALHOSTS: ${MEDIAMTX_WEBRTC_HOST:-}
+      # ICE 후보가 실제 host offset 포트를 광고하도록 컨테이너도 같은 포트에서 수신한다.
+      MTX_WEBRTCLOCALUDPADDRESS: ":${MEDIAMTX_ICE_UDP_PORT:?set MEDIAMTX_ICE_UDP_PORT in .env}"
+      # UDP 차단망을 위한 ICE TCP fallback.
+      MTX_WEBRTCLOCALTCPADDRESS: ":${MEDIAMTX_ICE_UDP_PORT:?set MEDIAMTX_ICE_UDP_PORT in .env}"
+      # mediamtx.yml authInternalUsers 순서와 강결합: 1=backend, 2=viewer_rescue_pose.
+      MTX_AUTHINTERNALUSERS_1_USER: ${MEDIAMTX_BACKEND_USER:-backend}
+      MTX_AUTHINTERNALUSERS_1_PASS: ${MEDIAMTX_BACKEND_PASS:?set MEDIAMTX_BACKEND_PASS in .env}
+      MTX_AUTHINTERNALUSERS_2_USER: ${MEDIAMTX_VIEWER_USER:-viewer_rescue_pose}
+      MTX_AUTHINTERNALUSERS_2_PASS: ${MEDIAMTX_VIEWER_PASS:?set MEDIAMTX_VIEWER_PASS in .env}
+      MTX_AUTHINTERNALUSERS_2_PERMISSIONS_0_PATH: "~^${MEDIAMTX_PATH_PREFIX:-rescue_pose}__"
+      MTX_AUTHINTERNALUSERS_2_PERMISSIONS_1_PATH: "~^${MEDIAMTX_PATH_PREFIX:-rescue_pose}__"
+    ports:
+      # API 는 backend control plane 용이라 host loopback 에만 노출한다.
+      - "127.0.0.1:${MEDIAMTX_API_PORT:?set MEDIAMTX_API_PORT in .env}:9997"
+      - "${MEDIAMTX_RTSP_PORT:?set MEDIAMTX_RTSP_PORT in .env}:8554"
+      - "${MEDIAMTX_WEBRTC_PORT:?set MEDIAMTX_WEBRTC_PORT in .env}:8889/tcp"
+      - "${MEDIAMTX_ICE_UDP_PORT:?set MEDIAMTX_ICE_UDP_PORT in .env}:${MEDIAMTX_ICE_UDP_PORT:?set MEDIAMTX_ICE_UDP_PORT in .env}/udp"
+      - "${MEDIAMTX_ICE_UDP_PORT:?set MEDIAMTX_ICE_UDP_PORT in .env}:${MEDIAMTX_ICE_UDP_PORT:?set MEDIAMTX_ICE_UDP_PORT in .env}/tcp"
+    volumes:
+      - ./mediamtx.yml:/mediamtx.yml:ro
+    networks:
+      - rescue-pose
+    restart: unless-stopped
+
 networks:
-  # 공유 mediamtx 망(harness-shared-mtx) — infra 가 생성, 여기선 외부 참조. backend 만 참여.
-  # frontend 는 브라우저가 직접 공유 mediamtx WebRTC(host:8889)에 닿으므로 망 불참.
-  harness-shared-mtx:
-    external: true
+  # Compose 가 프로젝트별 내부망을 생성한다. 외부 shared-mtx 인프라에 의존하지 않는다.
+  rescue-pose:
 
 volumes:
   ipcam_db:

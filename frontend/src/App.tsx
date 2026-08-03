@@ -1,6 +1,7 @@
 import { Routes, Route } from "react-router-dom";
 import DashboardPage from "./pages/DashboardPage";
 import SettingsPage from "./pages/SettingsPage";
+import { CameraRegistryProvider } from "./hooks/useCameraRegistry";
 
 /**
  * 라우팅 셸 — 정확히 2 페이지(U4/D2 확정): / = 관제 대시보드, /settings = 설정.
@@ -9,9 +10,11 @@ import SettingsPage from "./pages/SettingsPage";
  */
 export default function App() {
   return (
-    <Routes>
-      <Route path="/" element={<DashboardPage />} />
-      <Route path="/settings" element={<SettingsPage />} />
-    </Routes>
+    <CameraRegistryProvider>
+      <Routes>
+        <Route path="/" element={<DashboardPage />} />
+        <Route path="/settings" element={<SettingsPage />} />
+      </Routes>
+    </CameraRegistryProvider>
   );
 }

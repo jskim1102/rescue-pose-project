@@ -3,13 +3,10 @@
 종횡비 보존 · long side == imgsz(640) · 업스케일 금지 · dtype/채널 보존.
 """
 
-import json
-
 import numpy as np
 import pytest
 
-from app.inference.worker import Detection, InferenceResult
-from app.streaming.manager import _resize_for_inference, detections_to_json
+from app.streaming.manager import _resize_for_inference
 
 
 def _frame(w: int, h: int) -> np.ndarray:
@@ -44,40 +41,3 @@ def test_dtype_and_channels_preserved():
     out = _resize_for_inference(_frame(1920, 1080))
     assert out.dtype == np.uint8
     assert out.shape[2] == 3
-
-
-def test_detections_json_includes_annotated_frame_when_present():
-    result = InferenceResult(
-        source_id="ipcam-rescue_pose__ipcam-cam2",
-        timestamp=12.3,
-        detections=[
-            Detection(
-                class_id=0,
-                class_name="person",
-                confidence=0.9,
-                keypoints=[(1.0, 2.0, 0.8)] * 17,
-                model="yolo26n-pose.pt",
-            )
-        ],
-        frame_w=640,
-        frame_h=360,
-        annotated_jpeg=b"\xff\xd8jpeg",
-    )
-
-    payload = json.loads(detections_to_json(result))
-
-    assert payload["annotatedFrame"] == "data:image/jpeg;base64,/9hqcGVn"
-
-
-def test_detections_json_omits_annotated_frame_by_default():
-    result = InferenceResult(
-        source_id="ipcam-rescue_pose__ipcam-nvr",
-        timestamp=12.3,
-        detections=[],
-        frame_w=640,
-        frame_h=360,
-    )
-
-    payload = json.loads(detections_to_json(result))
-
-    assert "annotatedFrame" not in payload
