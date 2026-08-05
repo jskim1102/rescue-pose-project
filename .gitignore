@@ -37,3 +37,6 @@ dist/
 # detection — custom .pt 업로드(런타임 산출) + YOLO 가중치 캐시 (소스 아님)
 *.pt
 backend/models/
+
+# --- 대시보드에서 제외 (harness) ---
+/특허/
