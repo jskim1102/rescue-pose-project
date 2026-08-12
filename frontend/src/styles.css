@@ -22,10 +22,10 @@
   --rp-page-pad: clamp(0.5rem, 0.72vw, 1rem);
   --rp-gap: clamp(0.45rem, 0.55vw, 1rem);
   --rp-gap-sm: clamp(0.38rem, 0.46vw, 0.75rem);
-  --rp-topbar-h: clamp(48px, 5.2vh, 56px);
+  --rp-topbar-h: clamp(56px, 7vh, 68px);
   --rp-topbar-pad-y: clamp(0.42rem, 0.42vw, 0.75rem);
   --rp-topbar-pad-x: clamp(0.8rem, 0.86vw, 1.25rem);
-  --rp-cam-body-max-h: clamp(250px, 32vh, 560px);
+  --rp-cam-row-h: clamp(310px, 43.8vh, 450px);
   --rp-event-head-h: clamp(28px, 3vh, 34px);
   --rp-event-row-h: clamp(32px, 3.35vh, 40px);
 }

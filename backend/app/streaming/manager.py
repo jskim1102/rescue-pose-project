@@ -37,6 +37,7 @@ from app.config import (
     MIN_INFERENCE_INTERVAL,
 )
 from app.inference import FrameRequest, InferenceResult, InferenceWorker
+from app.posture_calibration import PostureCalibration
 from app.rescue import PersonRescue, RescueTracker
 from app.streaming.capture import SourceType, VideoCaptureThread
 
@@ -269,6 +270,9 @@ class StreamManager:
         self._rescue_trackers: dict[str, RescueTracker] = {}
         self._latest_rescue: dict[str, tuple[float, list[PersonRescue]]] = {}
         self._rescue_lock = threading.Lock()
+        # 카메라별 고정 보정값. API/시작 동기화가 교체하고 dispatch는 immutable 객체를 읽는다.
+        self._posture_calibrations: dict[str, PostureCalibration] = {}
+        self._posture_calibration_lock = threading.Lock()
         self._telemetry = InferenceTelemetry()
         self._source_telemetry: dict[str, SourceTelemetry] = {}
         self._telemetry_lock = threading.Lock()
@@ -519,6 +523,7 @@ class StreamManager:
             warned = getattr(self, "_slow_interval_warned", None)
             if warned is not None:
                 warned.discard(source_id)
+        self.clear_posture_calibration(source_id)
         self._recompute_cadence()
 
     def _sync_worker_models(self) -> None:
@@ -918,6 +923,23 @@ class StreamManager:
 
     def _update_rescue(self, result: InferenceResult) -> None:
         """최신 pose 결과를 rescue-pose의 연속 lying 판정에 연결한다."""
+        calibration = self.get_posture_calibration(result.source_id)
+        if calibration is not None:
+            for detection in result.detections:
+                try:
+                    detection.posture = calibration.classify(
+                        detection.keypoints,
+                        fallback=detection.posture or "standing",
+                        frame_width=result.frame_w,
+                        frame_height=result.frame_h,
+                    )
+                except (TypeError, ValueError, IndexError):
+                    # 한 프레임의 비정상 keypoint가 dispatch/watchdog 전체를 멈추면 안 된다.
+                    logger.warning(
+                        "posture calibration frame rejected: source_id=%s",
+                        result.source_id,
+                        exc_info=True,
+                    )
         rescue_lock = getattr(self, "_rescue_lock", None)
         if rescue_lock is None:
             return
@@ -927,7 +949,51 @@ class StreamManager:
                 tracker = RescueTracker()
                 self._rescue_trackers[result.source_id] = tracker
             states = tracker.update(result.detections, result.frame_w, result.frame_h)
+            for detection, state in zip(result.detections, states):
+                detection.posture = state.posture
             self._latest_rescue[result.source_id] = (result.timestamp, states)
+
+    def set_posture_calibration(
+        self,
+        source_id: str,
+        calibration: PostureCalibration,
+    ) -> None:
+        """source별 검증된 보정값을 원자 교체한다."""
+        lock = getattr(self, "_posture_calibration_lock", None)
+        calibrations = getattr(self, "_posture_calibrations", None)
+        if lock is None or calibrations is None:
+            return
+        with lock:
+            calibrations[source_id] = calibration
+
+    def get_posture_calibration(self, source_id: str) -> Optional[PostureCalibration]:
+        lock = getattr(self, "_posture_calibration_lock", None)
+        calibrations = getattr(self, "_posture_calibrations", None)
+        if lock is None or calibrations is None:
+            return None
+        with lock:
+            return calibrations.get(source_id)
+
+    def clear_posture_calibration(self, source_id: str) -> None:
+        lock = getattr(self, "_posture_calibration_lock", None)
+        calibrations = getattr(self, "_posture_calibrations", None)
+        if lock is None or calibrations is None:
+            return
+        with lock:
+            calibrations.pop(source_id, None)
+
+    def replace_posture_calibrations(
+        self,
+        calibrations: dict[str, PostureCalibration],
+    ) -> None:
+        """DB 시작 동기화용 전체 snapshot 교체. 삭제된 카메라의 stale 값도 함께 제거한다."""
+        lock = getattr(self, "_posture_calibration_lock", None)
+        current = getattr(self, "_posture_calibrations", None)
+        if lock is None or current is None:
+            return
+        with lock:
+            current.clear()
+            current.update(calibrations)
 
     def get_rescue_states(
         self,

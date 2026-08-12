@@ -22,7 +22,7 @@ import {
 /**
  * rescue-pose 관제 대시보드 (단일 화면 · tunnel DashboardPage 이식).
  *
- * - 실데이터: 등록된 전 ipcam(≤MAX_IPCAMS=16)을 NxN 그리드 라이브뷰로. 영상 = WHEP(WhepPlayer <video>),
+ * - 실데이터: 등록된 전 ipcam(≤MAX_IPCAMS=2)을 라이브뷰로. 영상 = WHEP(WhepPlayer <video>),
  *   자세 keypoint = detection WebSocket(useDetectionWs) → **KeypointOverlay(스켈레톤)** 로
  *   그린다. tunnel 의 bbox 오버레이(VideoBboxOverlay)는 §3 에 따라 차용하지 않는다.
  *   카메라 미등록/백엔드 없음이면 플레이스홀더(gate-2 = 백엔드 없이 렌더).
@@ -119,10 +119,12 @@ function CamLiveView({
   streamKey,
   label,
   onReport,
+  objectFit,
 }: {
   streamKey: string;
   label: string;
   onReport: (label: string, r: CamReport) => void;
+  objectFit: React.CSSProperties["objectFit"];
 }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const [detectionActive, setDetectionActive] = useState(false);
@@ -214,13 +216,14 @@ function CamLiveView({
           ● {live ? "LIVE" : "신호 없음"}
         </span>
       </div>
-      <div style={s.camBody}>
-        <WhepPlayer streamKey={streamKey} videoRef={videoRef} onFps={onFps} />
+      <div className="dashboard-camera-body" style={s.camBody}>
+        <WhepPlayer streamKey={streamKey} videoRef={videoRef} onFps={onFps} objectFit={objectFit} />
         <KeypointOverlay
           videoRef={videoRef}
           detections={items}
           frameW={frameW}
           frameH={frameH}
+          objectFit={objectFit}
         />
       </div>
     </div>
@@ -337,9 +340,10 @@ function DashboardPage() {
   const timeStr =
     `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}:${String(now.getSeconds()).padStart(2, "0")}`;
 
-  // 카메라 뷰 = 항상 2분할(2열). 등록 0/1/2개 무관 최소 2슬롯 유지 — 빈 슬롯은 CamPlaceholder.
-  // cams 가 3개+ 여도 2열 고정(여러 행). 실 카메라만 CamLiveView(WS/rescue), 나머지는 자리표시.
-  const camSlots = Math.max(2, cams.length);
+  // 등록 대수만큼만 표시한다. 0대일 때만 등록 안내용 슬롯 하나를 유지한다.
+  // 1대는 전체 폭, 2대 이상은 2열(여러 행)로 배치한다.
+  const camSlots = Math.max(1, cams.length);
+  const camColumns = Math.min(2, camSlots);
   const placeholderStatus = camsStatus === "ready" ? "empty" : camsStatus;
 
   // 이벤트 로그 페이지네이션 — 페이지당 PAGE_SIZE, page 는 저장범위 초과 시 clamp.
@@ -422,7 +426,7 @@ function DashboardPage() {
           </div>
 
           {/* 전-카메라 라이브뷰 그리드 (실데이터 · 스켈레톤 오버레이 · NxN) */}
-          <div style={{ ...s.camRow, gridTemplateColumns: "repeat(2, 1fr)" }}>
+          <div style={{ ...s.camRow, gridTemplateColumns: `repeat(${camColumns}, minmax(0, 1fr))` }}>
             {Array.from({ length: camSlots }).map((_, i) => {
               const cam = cams[i];
               const label = camLabel(i);
@@ -432,6 +436,7 @@ function DashboardPage() {
                   streamKey={cam.stream_key}
                   label={label}
                   onReport={reportCam}
+                  objectFit={cams.length === 1 ? "contain" : "cover"}
                 />
               ) : (
                 <CamPlaceholder key={`ph-${i}`} label={label} status={placeholderStatus} />
@@ -440,7 +445,7 @@ function DashboardPage() {
           </div>
 
           {/* 이벤트 로그 (실데이터 — needs-rescue 전이, 최근 순) */}
-          <div style={s.panel}>
+          <div style={{ ...s.panel, ...s.eventPanel }}>
             <div style={s.panelHeader}>
               <span style={s.panelTitle}>이벤트 로그</span>
               <div style={s.eventHeaderActions}>
@@ -459,44 +464,46 @@ function DashboardPage() {
                 <span style={s.viewAll} onClick={() => { setEvents([]); setPage(0); }}>이벤트 삭제</span>
               </div>
             </div>
-            <table style={s.table}>
-              <colgroup>
-                <col style={{ width: "86px" }} />
-                <col style={{ width: "220px" }} />
-                <col style={{ width: "84px" }} />
-                <col style={{ width: "86px" }} />
-                <col style={{ width: "100px" }} />
-                <col />
-                <col style={{ width: "64px" }} />
-              </colgroup>
-              <thead>
-                <tr>
-                  {["시간", "이벤트", "카메라", "환자 ID", "위험도", "상세 내용", ""].map((h, i) => (
-                    <th key={i} style={s.th}>{h}</th>
+            <div style={s.eventTableWrap}>
+              <table style={s.table}>
+                <colgroup>
+                  <col style={{ width: "86px" }} />
+                  <col style={{ width: "220px" }} />
+                  <col style={{ width: "84px" }} />
+                  <col style={{ width: "86px" }} />
+                  <col style={{ width: "100px" }} />
+                  <col />
+                  <col style={{ width: "64px" }} />
+                </colgroup>
+                <thead>
+                  <tr>
+                    {["시간", "이벤트", "카메라", "환자 ID", "위험도", "상세 내용", ""].map((h, i) => (
+                      <th key={i} style={s.th}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {evtSlice.map((e) => (
+                    <tr key={e.id} style={s.trow}>
+                      <td style={s.tdTime}>{e.time}</td>
+                      <td style={s.td}>
+                        <span style={s.eventCell}><EventIcon risk={e.risk} /><span style={s.cellText}>{e.kind}</span></span>
+                      </td>
+                      <td style={{ ...s.td, whiteSpace: "nowrap" }}>{e.cam}</td>
+                      <td style={{ ...s.td, color: C.muted, whiteSpace: "nowrap" }}>{e.patientId}</td>
+                      <td style={s.td}><RiskBadge risk={e.risk} /></td>
+                      <td style={{ ...s.td, color: C.muted }} title={e.detail}>{e.detail}</td>
+                      <td style={s.td}><div style={s.thumb} title="스냅샷 (배선 예정)"><div style={s.thumbIcon} /></div></td>
+                    </tr>
                   ))}
-                </tr>
-              </thead>
-              <tbody>
-                {evtSlice.map((e) => (
-                  <tr key={e.id} style={s.trow}>
-                    <td style={s.tdTime}>{e.time}</td>
-                    <td style={s.td}>
-                      <span style={s.eventCell}><EventIcon risk={e.risk} /><span style={s.cellText}>{e.kind}</span></span>
-                    </td>
-                    <td style={{ ...s.td, whiteSpace: "nowrap" }}>{e.cam}</td>
-                    <td style={{ ...s.td, color: C.muted, whiteSpace: "nowrap" }}>{e.patientId}</td>
-                    <td style={s.td}><RiskBadge risk={e.risk} /></td>
-                    <td style={{ ...s.td, color: C.muted }} title={e.detail}>{e.detail}</td>
-                    <td style={s.td}><div style={s.thumb} title="스냅샷 (배선 예정)"><div style={s.thumbIcon} /></div></td>
-                  </tr>
-                ))}
-                {Array.from({ length: PAGE_SIZE - evtSlice.length }).map((_, i) => (
-                  <tr key={`empty-${i}`} style={s.trow}>
-                    <td colSpan={7} style={s.td} />
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+                  {Array.from({ length: PAGE_SIZE - evtSlice.length }).map((_, i) => (
+                    <tr key={`empty-${i}`} style={s.trow}>
+                      <td colSpan={7} style={s.td} />
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
 
@@ -546,7 +553,7 @@ function DashboardPage() {
           </div>
 
           {/* 상황 판단 결과 (실데이터) */}
-          <div style={s.panel}>
+          <div style={{ ...s.panel, ...s.aiPanel }}>
             <div style={s.panelTitle}>상황 판단 결과 <span style={s.panelTitleSub}>(AI)</span></div>
             <p style={s.aiText}>현재 총 {totals.people}명의 인원이 탐지되었습니다.</p>
             <ul style={s.aiList}>
@@ -564,7 +571,7 @@ function DashboardPage() {
           </div>
 
           {/* 주요 기능 (mock) */}
-          <div style={s.panel}>
+          <div style={{ ...s.panel, ...s.functionPanel }}>
             <div style={s.panelTitle}>주요 기능</div>
             <div style={s.funcGrid}>
               <FuncBtn color={C.red} title="119 출동 요청" sub="자동 구조대 지원 요청" icon="🚑" />
@@ -615,7 +622,7 @@ function FuncBtn({ color, title, sub, icon }: { color: string; title: string; su
 }
 
 const s: Record<string, React.CSSProperties> = {
-  root: { minHeight: "100vh", overflowX: "hidden", background: C.bg, color: C.text },
+  root: { minHeight: "100vh", minBlockSize: "100dvh", display: "flex", flexDirection: "column", overflowX: "hidden", background: C.bg, color: C.text },
 
   // 상단 바 우측 슬롯
   btnAlertTop: { padding: "0.48rem 0.95rem", borderRadius: "8px", border: "none", background: C.red, color: "#fff", fontWeight: 700, fontSize: "0.86rem", cursor: "pointer" },
@@ -624,25 +631,25 @@ const s: Record<string, React.CSSProperties> = {
   clockTime: { fontSize: "1.05rem", fontWeight: 700 },
 
   // 본문
-  body: { minHeight: 0, display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(320px, 360px)", gap: "var(--rp-gap)", padding: "var(--rp-page-pad)", alignItems: "stretch" },
+  body: { flex: "1 1 auto", minHeight: 0, display: "grid", gridTemplateColumns: "minmax(0, 1fr) clamp(360px, 23.5vw, 480px)", gap: "var(--rp-gap)", padding: "var(--rp-page-pad)", alignItems: "stretch" },
   colMain: { display: "flex", flexDirection: "column", gap: "var(--rp-gap)", minWidth: 0, minHeight: 0 },
   colSide: { display: "flex", flexDirection: "column", gap: "var(--rp-gap)", minHeight: 0, alignSelf: "stretch" },
 
   // stat 카드
   statRow: { display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "var(--rp-gap-sm)", flexShrink: 0 },
-  statCard: { display: "flex", alignItems: "center", gap: "0.68rem", minHeight: "clamp(58px, 6.8vh, 76px)", padding: "0.72rem 0.85rem", background: C.panel, border: `1px solid ${C.border}`, borderRadius: "10px" },
+  statCard: { display: "flex", alignItems: "center", gap: "0.68rem", minHeight: "clamp(76px, 10.7vh, 110px)", padding: "0.72rem 0.85rem", background: C.panel, border: `1px solid ${C.border}`, borderRadius: "10px" },
   statIcon: { fontSize: "1.38rem" },
   statLabel: { fontSize: "0.8rem", color: C.muted },
   statValue: { fontSize: "1.45rem", fontWeight: 800, lineHeight: 1.05 },
   statUnit: { fontSize: "0.85rem", fontWeight: 500, color: C.muted },
 
   // CAM
-  camRow: { display: "grid", gap: "var(--rp-gap-sm)", minHeight: 0, flexShrink: 1 },
-  camCard: { minHeight: 0, background: C.panel, border: `1px solid ${C.border}`, borderRadius: "10px", overflow: "hidden" },
+  camRow: { display: "grid", gridAutoRows: "var(--rp-cam-row-h)", gap: "var(--rp-gap-sm)", minHeight: 0, flexShrink: 0 },
+  camCard: { minHeight: 0, display: "flex", flexDirection: "column", background: C.panel, border: `1px solid ${C.border}`, borderRadius: "10px", overflow: "hidden" },
   camHeader: { display: "flex", alignItems: "center", justifyContent: "space-between", minHeight: "30px", padding: "0.35rem 0.65rem" },
   camLabel: { fontSize: "0.85rem", fontWeight: 600 },
   liveTag: { fontSize: "0.75rem", fontWeight: 700 },
-  camBody: { position: "relative", aspectRatio: "16 / 9", maxHeight: "var(--rp-cam-body-max-h)", background: "#000", display: "flex", alignItems: "center", justifyContent: "center" },
+  camBody: { position: "relative", flex: "1 1 auto", minHeight: 0, width: "100%", background: "#000", display: "flex", alignItems: "center", justifyContent: "center" },
   camPlaceholder: { color: C.muted, fontSize: "0.85rem" },
 
   // 공용 패널
@@ -651,6 +658,10 @@ const s: Record<string, React.CSSProperties> = {
   panelTitle: { fontSize: "0.95rem", fontWeight: 700 },
   panelTitleSub: { fontSize: "0.78rem", fontWeight: 500, color: C.muted },
   linkBtn: { fontSize: "0.78rem", color: C.muted, cursor: "pointer" },
+
+  // 이벤트 로그는 카메라 아래의 남는 높이를 모두 사용한다.
+  eventPanel: { flex: "1 1 0", minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" },
+  eventTableWrap: { flex: "1 1 auto", minHeight: 0, overflow: "hidden" },
 
   // 테이블
   table: { width: "100%", borderCollapse: "collapse", tableLayout: "fixed" },
@@ -687,12 +698,14 @@ const s: Record<string, React.CSSProperties> = {
   prioDetail: { fontSize: "0.72rem", color: C.muted, marginTop: "0.25rem" },
 
   // 상황판단 AI
+  aiPanel: { flex: "0 0 clamp(168px, 21.8vh, 225px)", overflow: "hidden" },
   aiText: { fontSize: "0.85rem", margin: "0 0 0.5rem" },
   aiList: { margin: 0, paddingLeft: "1.1rem", fontSize: "0.8rem", color: C.muted, lineHeight: 1.55 },
   aiHighlight: { fontSize: "0.85rem", fontWeight: 700, color: C.red, marginTop: "0.5rem" },
 
   // 주요 기능
-  funcGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.5rem" },
+  functionPanel: { flex: "0 0 clamp(260px, 34.2vh, 350px)", minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" },
+  funcGrid: { flex: "1 1 auto", minHeight: 0, display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.5rem" },
   funcBtn: { display: "flex", flexDirection: "column", gap: "0.16rem", padding: "0.62rem", background: C.panel2, border: "1px solid", borderRadius: "8px", color: C.text, cursor: "pointer", textAlign: "left" },
   funcIcon: { fontSize: "1.05rem" },
   funcTitle: { fontSize: "0.85rem", fontWeight: 700 },

@@ -40,3 +40,5 @@ backend/models/
 
 # --- 대시보드에서 제외 (harness) ---
 /특허/
+/a29f25c6-13c0-40f5-869d-5de347e6def4_rescue-pose_테스트.pdf
+/test_result.zip

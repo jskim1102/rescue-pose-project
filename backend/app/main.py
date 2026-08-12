@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import CORS_ORIGINS, MAX_IPCAMS, logger
 from app.database import SessionLocal, init_db
 from app.inference_api import inference_router
-from app.ipcam import router as ipcam_router
+from app.ipcam import load_posture_calibrations, router as ipcam_router
 from app.mediamtx import sync_streams
 from app.streaming.manager import manager as stream_manager
 
@@ -17,6 +17,8 @@ def _bg_sync() -> None:
     """DB 카메라 재등록을 서버 시작과 분리해 백그라운드에서 수행한다."""
     db = SessionLocal()
     try:
+        # ffprobe/mediamtx 동기화보다 먼저 메모리 보정을 복원한다.
+        load_posture_calibrations(db)
         sync_streams(db)
     finally:
         db.close()

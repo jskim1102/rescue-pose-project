@@ -3,6 +3,7 @@ import Topbar from "../components/Topbar";
 import SegmentedToggle from "../components/SegmentedToggle";
 import ModelManagerModal from "../components/ModelManagerModal";
 import ModelSettingsModal, { type ModelSettings } from "../components/ModelSettingsModal";
+import PostureCalibrationModal from "../components/PostureCalibrationModal";
 import { apiBase } from "../hooks/useApi";
 import {
   type RegisteredCamera,
@@ -37,6 +38,7 @@ const C = {
 
 const DEFAULT_CONF = 0.5; // 워커 conf fallback (YOLO_CONF_THRESHOLD 정본).
 const DEFAULT_GPU_UTIL_TARGET_PCT = 95;
+const MAX_CAMERAS = 2;
 
 interface CamStats {
   active: boolean;
@@ -57,6 +59,7 @@ function SettingsPage() {
     status: camsStatus,
     refreshCameras,
   } = useCameraRegistry();
+  const atCameraLimit = cams.length >= MAX_CAMERAS;
   const [stats, setStats] = useState<Record<string, CamStats>>({});
 
   // ── 추론 컨트롤 (CamerasPage 차용) ──
@@ -68,6 +71,7 @@ function SettingsPage() {
   >({});
   const [modalCamKey, setModalCamKey] = useState<string | null>(null); // 모델 관리 모달
   const [confModalCamKey, setConfModalCamKey] = useState<string | null>(null); // 모델 설정 모달
+  const [calibrationCamId, setCalibrationCamId] = useState<number | null>(null);
   const [gpuUtilTargetPct, setGpuUtilTargetPct] = useState(
     DEFAULT_GPU_UTIL_TARGET_PCT
   );
@@ -282,6 +286,10 @@ function SettingsPage() {
 
   const handleAdd = async () => {
     if (submitting) return; // 중복 제출 방지
+    if (atCameraLimit) {
+      setMsg({ kind: "err", text: `카메라는 최대 ${MAX_CAMERAS}대까지 등록할 수 있습니다` });
+      return;
+    }
     if (!rtspUrl.trim()) {
       setMsg({ kind: "err", text: "RTSP 주소를 입력하세요" });
       return;
@@ -315,6 +323,7 @@ function SettingsPage() {
     ...s.input,
     borderColor: focus === k ? C.red : C.border,
   });
+  const calibrationCamera = cams.find((camera) => camera.id === calibrationCamId);
 
   return (
     <div style={s.root}>
@@ -326,7 +335,7 @@ function SettingsPage() {
         <section style={s.panel}>
           <div style={s.panelHeader}>
             <span style={s.panelTitle}>📹 카메라 등록</span>
-            <span style={s.panelTitleSub}>CAMERA REGISTER</span>
+            <span style={s.panelTitleSub}>CAMERA REGISTER · 최대 {MAX_CAMERAS}대</span>
           </div>
 
           <div style={s.formRow}>
@@ -352,11 +361,11 @@ function SettingsPage() {
               />
             </div>
             <button
-              style={{ ...s.addBtn, ...(submitting ? { opacity: 0.6, cursor: "default" } : {}) }}
+              style={{ ...s.addBtn, ...(submitting || atCameraLimit ? { opacity: 0.6, cursor: "default" } : {}) }}
               onClick={handleAdd}
-              disabled={submitting}
+              disabled={submitting || atCameraLimit}
             >
-              {submitting ? "등록 중…" : "추가"}
+              {atCameraLimit ? "최대 2대" : submitting ? "등록 중…" : "추가"}
             </button>
           </div>
 
@@ -464,6 +473,9 @@ function SettingsPage() {
                       >
                         설정
                       </button>
+                      <button style={s.ctrlBtn} onClick={() => setCalibrationCamId(c.id)}>
+                        보정
+                      </button>
                       <SegmentedToggle
                         enabled={camEnabled}
                         onChange={(on) => toggleInference(c.stream_key, on)}
@@ -502,6 +514,21 @@ function SettingsPage() {
           selectedModels={modelsByCam[confModalCamKey] ?? []}
           settings={modelSettingsByCam[confModalCamKey] ?? {}}
           onSettingsChange={(next) => handleSettingsChange(confModalCamKey, next)}
+        />
+      )}
+
+      {calibrationCamId !== null && (
+        <PostureCalibrationModal
+          open={calibrationCamId !== null}
+          onClose={() => setCalibrationCamId(null)}
+          cameraId={calibrationCamId}
+          cameraName={calibrationCamera?.name ?? "카메라"}
+          streamKey={calibrationCamera?.stream_key ?? ""}
+          inferenceActive={enabled[calibrationCamera?.stream_key ?? ""] ?? false}
+          hasModels={(modelsByCam[calibrationCamera?.stream_key ?? ""]?.length ?? 0) > 0}
+          onEnableInference={() => {
+            if (calibrationCamera) void toggleInference(calibrationCamera.stream_key, true);
+          }}
         />
       )}
     </div>

@@ -946,47 +946,111 @@ def _angle_three_points(
 
 
 def _classify_posture(kpts: list[tuple[int, int, float]]) -> str:
-    """COCO 17 keypoints → standing / sitting / lying."""
+    """COCO17의 몸통·전체 몸축·관절각을 조합해 세 자세를 분류한다."""
     if len(kpts) < 17:
         return "standing"
 
     min_confidence = 0.3
+    max_lying_torso_angle = 55
+    min_lying_hip_angle = 135
+    max_flat_body_angle = 55
+    max_horizontal_body_angle = 35
+    min_horizontal_aspect_ratio = 1.2
+    max_sitting_knee_angle = 120
+    min_sitting_hip_angle = 55
+    max_sitting_hip_angle = 120
     left_shoulder, right_shoulder = kpts[5], kpts[6]
     left_hip, right_hip = kpts[11], kpts[12]
     left_knee, right_knee = kpts[13], kpts[14]
     left_ankle, right_ankle = kpts[15], kpts[16]
 
-    if not all(
-        point[2] > min_confidence
-        for point in [left_shoulder, right_shoulder, left_hip, right_hip]
-    ):
+    sides = [
+        (left_shoulder, left_hip, left_knee, left_ankle),
+        (right_shoulder, right_hip, right_knee, right_ankle),
+    ]
+    visible_sides = [
+        side
+        for side in sides
+        if side[0][2] > min_confidence and side[1][2] > min_confidence
+    ]
+    if not visible_sides:
         return "standing"
 
-    shoulder_mid = (
-        (left_shoulder[0] + right_shoulder[0]) / 2,
-        (left_shoulder[1] + right_shoulder[1]) / 2,
+    def midpoint(points: list[tuple[int, int, float]]) -> tuple[float, float]:
+        return (
+            sum(point[0] for point in points) / len(points),
+            sum(point[1] for point in points) / len(points),
+        )
+
+    shoulder_mid = midpoint([side[0] for side in visible_sides])
+    hip_mid = midpoint([side[1] for side in visible_sides])
+
+    def axis_angle(a: tuple[float, float], b: tuple[float, float]) -> float:
+        return math.degrees(math.atan2(abs(b[1] - a[1]), abs(b[0] - a[0])))
+
+    torso_angle = axis_angle(shoulder_mid, hip_mid)
+
+    hip_angles = [
+        _angle_three_points(shoulder, hip, knee)
+        for shoulder, hip, knee, _ in visible_sides
+        if knee[2] > min_confidence
+    ]
+
+    visible_ankles = [
+        ankle for _, _, _, ankle in visible_sides if ankle[2] > min_confidence
+    ]
+    visible_knees = [
+        knee for _, _, knee, _ in visible_sides if knee[2] > min_confidence
+    ]
+    lower_points = visible_ankles or visible_knees
+    body_angle = (
+        axis_angle(shoulder_mid, midpoint(lower_points)) if lower_points else None
     )
-    hip_mid = (
-        (left_hip[0] + right_hip[0]) / 2,
-        (left_hip[1] + right_hip[1]) / 2,
+
+    pose_points = [
+        point
+        for point in kpts[5:7] + kpts[11:17]
+        if point[2] > min_confidence
+    ]
+    pose_width = max(point[0] for point in pose_points) - min(
+        point[0] for point in pose_points
     )
-    torso_angle = math.degrees(
-        math.atan2(
-            abs(hip_mid[1] - shoulder_mid[1]),
-            abs(hip_mid[0] - shoulder_mid[0]),
+    pose_height = max(point[1] for point in pose_points) - min(
+        point[1] for point in pose_points
+    )
+    pose_aspect_ratio = pose_width / max(pose_height, 1)
+
+    # 허리를 숙인 사람은 몸통만 수평이고 어깨→발목 축은 수직에 가깝다. 누운 사람은
+    # 골반이 펴져 있거나, 웅크려도 전체 몸축/폭이 바닥 방향으로 놓인다.
+    straight_hips = bool(hip_angles) and min(hip_angles) >= min_lying_hip_angle
+    flat_body = body_angle is not None and (
+        body_angle <= max_horizontal_body_angle
+        or (
+            body_angle <= max_flat_body_angle
+            and pose_aspect_ratio >= min_horizontal_aspect_ratio
         )
     )
-    if torso_angle < 35:
+    if torso_angle <= max_lying_torso_angle and (straight_hips or flat_body):
         return "lying"
 
-    leg_angles = [
+    knee_angles = [
         _angle_three_points(hip, knee, ankle)
-        for hip, knee, ankle in [
-            (left_hip, left_knee, left_ankle),
-            (right_hip, right_knee, right_ankle),
-        ]
+        for _, hip, knee, ankle in visible_sides
         if knee[2] > min_confidence and ankle[2] > min_confidence
     ]
-    if leg_angles and sum(leg_angles) / len(leg_angles) < 130:
+    if knee_angles and min(knee_angles) <= max_sitting_knee_angle:
+        return "sitting"
+
+    # 발목이 가려진 경우에는 상체가 서 있고 어깨-골반-무릎이 직각에 가까운 다리를
+    # 사용한다. 몸통 수평인 허리 숙임에는 이 fallback을 적용하지 않는다.
+    partial_hip_angles = [
+        _angle_three_points(shoulder, hip, knee)
+        for shoulder, hip, knee, ankle in visible_sides
+        if knee[2] > min_confidence and ankle[2] <= min_confidence
+    ]
+    if torso_angle > max_lying_torso_angle and any(
+        min_sitting_hip_angle <= angle <= max_sitting_hip_angle
+        for angle in partial_hip_angles
+    ):
         return "sitting"
     return "standing"

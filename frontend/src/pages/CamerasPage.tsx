@@ -24,7 +24,7 @@ interface Stat {
   readers: number;
 }
 
-const MAX_IPCAMS_FALLBACK = 16; // spec F4 — /api/config 로딩 전 기본값. 실제 cap 은 백엔드 env.
+const MAX_IPCAMS_FALLBACK = 2; // /api/config 로딩 전 제품 상한. 실제 cap 은 백엔드가 강제한다.
 const DEFAULT_CONF = 0.5; // deepeye 정본 (YOLO_CONF_THRESHOLD).
 const DEFAULT_GPU_UTIL_TARGET_PCT = 95;
 

@@ -17,8 +17,8 @@ import {
  * - keypoints 좌표는 추론 캡처 프레임(frameW×frameH) 좌표계 → `videoNatural / detFrame`
  *   스케일로 그린다. **두 해상도가 같으면 sx=sy=1 (identity), 다르면 자동 보정.**
  *   (frameW/H 미상=0 이면 identity 가정.)
- * - canvas 는 video 와 동일 박스에 절대배치(inset:0, 100%)하되 `object-fit:contain` 으로
- *   video 와 똑같이 레터/필러박싱 → 비 16:9 카메라(예 4:3)에서도 화면상 정렬.
+ * - canvas 는 video 와 동일 박스에 절대배치(inset:0, 100%). 기본 `contain`이며,
+ *   대시보드처럼 video 가 `cover`인 소비자는 같은 objectFit 을 넘겨 화면상 정렬한다.
  *
  * pose 는 단일 class(person)라 class filter/색상 override 가 없다 → settings prop 없음.
  * 사람 단위 conf 는 서버(워커)에서 이미 적용됨. per-keypoint viz 임계는 아래 상수.
@@ -52,6 +52,8 @@ interface Props {
   // YOLO 가 본 추론 캡처 프레임 치수 (WS frame:{w,h}). 0 이면 스케일 = identity.
   frameW: number;
   frameH: number;
+  // 반드시 같은 영역의 <video> object-fit 과 일치해야 좌표가 어긋나지 않는다.
+  objectFit?: React.CSSProperties["objectFit"];
 }
 
 function KeypointOverlay({
@@ -59,6 +61,7 @@ function KeypointOverlay({
   detections,
   frameW,
   frameH,
+  objectFit = "contain",
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [size, setSize] = useState<{ w: number; h: number } | null>(null);
@@ -183,7 +186,7 @@ function KeypointOverlay({
       ref={canvasRef}
       width={size.w}
       height={size.h}
-      style={canvasStyle}
+      style={{ ...canvasStyle, objectFit }}
     />
   );
 }
@@ -193,7 +196,6 @@ const canvasStyle: React.CSSProperties = {
   inset: 0,
   width: "100%",
   height: "100%",
-  objectFit: "contain",
   pointerEvents: "none",
 };
 

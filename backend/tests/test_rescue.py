@@ -7,10 +7,13 @@
 실제 감지는 ~10fps 연속이므로 시간 경과는 expiry 보다 작은 step 으로 update 를 계속
 호출해(=계속 감지) 시뮬한다(`feed`). 단일 점프 = "감지 gap"(별도 테스트).
 """
+import threading
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Optional
 
 from app.rescue import RescueTracker
+from app.streaming.manager import StreamManager
 
 
 class Clock:
@@ -84,6 +87,82 @@ def test_posture_change_resets():
     assert s[0].lying_sec == 0.0
     s = feed(tr, clk, [person(100, 100, "standing")], 20.0)  # standing 지속
     assert s[0].rescue_needed is False
+
+
+def test_single_frame_sitting_standing_jitter_is_suppressed():
+    clk = Clock()
+    tr = _tracker(clk)
+    s = tr.update([person(100, 100, "standing")], **FRAME)
+    assert s[0].posture == "standing"
+
+    clk.advance(0.1)
+    s = tr.update([person(100, 100, "sitting")], **FRAME)
+    assert s[0].posture == "standing"
+
+    clk.advance(0.1)
+    s = tr.update([person(100, 100, "standing")], **FRAME)
+    assert s[0].posture == "standing"
+
+
+def test_sitting_standing_transition_is_accepted_after_it_persists():
+    clk = Clock()
+    tr = _tracker(clk)
+    tr.update([person(100, 100, "standing")], **FRAME)
+
+    clk.advance(0.1)
+    s = tr.update([person(100, 100, "sitting")], **FRAME)
+    assert s[0].posture == "standing"
+
+    clk.advance(0.4)
+    s = tr.update([person(100, 100, "sitting")], **FRAME)
+    assert s[0].posture == "sitting"
+
+
+def test_lying_transitions_bypass_sitting_standing_stabilization():
+    clk = Clock()
+    tr = _tracker(clk)
+    tr.update([person(100, 100, "standing")], **FRAME)
+
+    clk.advance(0.1)
+    s = tr.update([person(100, 100, "lying")], **FRAME)
+    assert s[0].posture == "lying"
+
+    clk.advance(0.1)
+    s = tr.update([person(100, 100, "standing")], **FRAME)
+    assert s[0].posture == "standing"
+    assert s[0].lying_sec == 0.0
+
+
+def test_manager_publishes_stabilized_posture_instead_of_raw_jitter():
+    clk = Clock()
+    tracker = RescueTracker(lying_threshold_s=N, expiry_s=3.0, now=clk)
+    manager = StreamManager.__new__(StreamManager)
+    manager._rescue_lock = threading.Lock()
+    manager._rescue_trackers = {"cam": tracker}
+    manager._latest_rescue = {}
+
+    standing = person(100, 100, "standing")
+    first = SimpleNamespace(
+        source_id="cam",
+        timestamp=1.0,
+        frame_w=FRAME["frame_w"],
+        frame_h=FRAME["frame_h"],
+        detections=[standing],
+    )
+    manager._update_rescue(first)
+
+    clk.advance(0.1)
+    jitter = person(100, 100, "sitting")
+    second = SimpleNamespace(
+        source_id="cam",
+        timestamp=2.0,
+        frame_w=FRAME["frame_w"],
+        frame_h=FRAME["frame_h"],
+        detections=[jitter],
+    )
+    manager._update_rescue(second)
+
+    assert jitter.posture == "standing"
 
 
 def test_detection_gap_expires_state():

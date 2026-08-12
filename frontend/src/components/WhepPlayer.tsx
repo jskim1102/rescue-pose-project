@@ -4,6 +4,7 @@ import { whepBase, whepAuthHeaders } from "../hooks/useApi";
 interface Props {
   streamKey: string;
   onFps?: (fps: number) => void;
+  objectFit?: React.CSSProperties["objectFit"];
   // 부모가 <video> 를 공유받기 위한 ref(선택) — KeypointOverlay 가 이 위에 canvas 를 겹친다.
   // 주면 그걸 video 에 붙이고(동시에 WebRTC 도 사용), 없으면 내부 ref.
   videoRef?: React.RefObject<HTMLVideoElement | null>;
@@ -12,7 +13,7 @@ interface Props {
 // mediamtx WHEP 플레이어 — native RTCPeerConnection.
 // createOffer → POST SDP → setRemoteDescription(answer) → ontrack → <video>.
 // WHEP 실패·연결 끊김 시 backoff 로 제한적 재시도(mediamtx 재시작/일시 404·503·네트워크 복원력).
-export default function WhepPlayer({ streamKey, onFps, videoRef: externalRef }: Props) {
+export default function WhepPlayer({ streamKey, onFps, objectFit, videoRef: externalRef }: Props) {
   const internalRef = useRef<HTMLVideoElement>(null);
   const videoRef = externalRef ?? internalRef;
   const [failed, setFailed] = useState(false);
@@ -127,5 +128,14 @@ export default function WhepPlayer({ streamKey, onFps, videoRef: externalRef }: 
     return <span className="grid-cell-nosignal">연결 실패</span>;
   }
 
-  return <video ref={videoRef} className="grid-cell-video" autoPlay muted playsInline />;
+  return (
+    <video
+      ref={videoRef}
+      className="grid-cell-video"
+      style={{ objectFit, background: objectFit ? "#000" : undefined }}
+      autoPlay
+      muted
+      playsInline
+    />
+  );
 }

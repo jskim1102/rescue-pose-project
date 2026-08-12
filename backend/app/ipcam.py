@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from datetime import datetime
 
@@ -13,6 +14,7 @@ from app.masking import _MASK, _restore_masked_password, _split_credentials, mas
 from app.mediamtx import ensure_stream, register_stream, remove_stream, update_stream
 from app.mediamtx import _validate_rtsp_url
 from app.models import IpCam
+from app.posture_calibration import PostureCalibration
 from app.streaming.manager import detections_to_json
 from app.streaming.manager import manager as stream_manager
 
@@ -126,6 +128,47 @@ class IpCamResponse(BaseModel):
         return mask_rtsp_credentials(v)
 
 
+class StandingReferencePayload(BaseModel):
+    foot_px: tuple[float, float]
+    keypoint_height_px: float
+    height_m: float
+
+
+class PostureCalibrationPayload(BaseModel):
+    frame_width: int
+    frame_height: int
+    floor_image_points: list[tuple[float, float]]
+    floor_world_points: list[tuple[float, float]]
+    standing_references: list[StandingReferencePayload]
+
+
+class PostureCalibrationState(BaseModel):
+    enabled: bool
+    calibration: PostureCalibrationPayload | None
+
+
+def _parse_calibration(raw: str) -> PostureCalibration:
+    try:
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            raise ValueError("보정값은 JSON object여야 합니다")
+        return PostureCalibration.from_dict(payload)
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise ValueError("저장된 posture 보정값이 손상되었습니다") from exc
+
+
+def load_posture_calibrations(db: Session) -> None:
+    """서버 시작 시 DB의 유효한 카메라 보정 snapshot을 manager에 복원한다."""
+    loaded: dict[str, PostureCalibration] = {}
+    for cam in db.query(IpCam).filter(IpCam.posture_calibration.is_not(None)).all():
+        try:
+            loaded[_source_id(cam.stream_key)] = _parse_calibration(cam.posture_calibration)
+        except ValueError:
+            # 한 행의 수동 DB 오염 때문에 다른 카메라 추론까지 기동 실패시키지 않는다.
+            logger.exception("손상된 posture 보정값 무시: cam_id=%d", cam.id)
+    stream_manager.replace_posture_calibrations(loaded)
+
+
 # ─── 엔드포인트 ───
 
 
@@ -168,6 +211,75 @@ def create_ipcam(body: IpCamCreate, db: Session = Depends(get_db)) -> IpCam:
     db.refresh(cam)
     logger.info("IP CAM 등록: id=%d name=%s stream_key=%s", cam.id, cam.name, cam.stream_key)
     return cam
+
+
+def _get_cam_or_404(cam_id: int, db: Session) -> IpCam:
+    cam = db.query(IpCam).filter(IpCam.id == cam_id).first()
+    if cam is None:
+        raise HTTPException(status_code=404, detail="IP CAM을 찾을 수 없습니다")
+    return cam
+
+
+@router.get("/{cam_id}/calibration", response_model=PostureCalibrationState)
+def get_ipcam_calibration(
+    cam_id: int,
+    db: Session = Depends(get_db),
+) -> PostureCalibrationState:
+    """카메라별 바닥/원근 posture 보정값 조회."""
+    cam = _get_cam_or_404(cam_id, db)
+    if cam.posture_calibration is None:
+        return PostureCalibrationState(enabled=False, calibration=None)
+    try:
+        calibration = _parse_calibration(cam.posture_calibration)
+    except ValueError as exc:
+        logger.exception("손상된 posture 보정값 조회 실패: cam_id=%d", cam_id)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return PostureCalibrationState(
+        enabled=True,
+        calibration=PostureCalibrationPayload.model_validate(calibration.to_dict()),
+    )
+
+
+@router.put("/{cam_id}/calibration", response_model=PostureCalibrationState)
+def set_ipcam_calibration(
+    cam_id: int,
+    body: PostureCalibrationPayload,
+    db: Session = Depends(get_db),
+) -> PostureCalibrationState:
+    """보정값을 검증·영속화하고 해당 source의 다음 추론 프레임부터 적용한다."""
+    cam = _get_cam_or_404(cam_id, db)
+    try:
+        calibration = PostureCalibration.from_dict(body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    canonical = calibration.to_dict()
+    cam.posture_calibration = json.dumps(
+        canonical,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+    db.commit()
+    stream_manager.set_posture_calibration(
+        _source_id(cam.stream_key),
+        calibration,
+    )
+    logger.info("posture 보정 저장: cam_id=%d rmse=%.4fm", cam_id, calibration.reprojection_rmse_m)
+    return PostureCalibrationState(
+        enabled=True,
+        calibration=PostureCalibrationPayload.model_validate(canonical),
+    )
+
+
+@router.delete("/{cam_id}/calibration", status_code=204)
+def delete_ipcam_calibration(cam_id: int, db: Session = Depends(get_db)) -> None:
+    """저장·메모리 보정값을 지우고 기존 keypoint 휴리스틱으로 즉시 복귀한다."""
+    cam = _get_cam_or_404(cam_id, db)
+    cam.posture_calibration = None
+    db.commit()
+    stream_manager.clear_posture_calibration(_source_id(cam.stream_key))
+    logger.info("posture 보정 초기화: cam_id=%d", cam_id)
 
 
 @router.put("/{cam_id}", response_model=IpCamResponse)

@@ -2,7 +2,7 @@ import os
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Integer, String
+from sqlalchemy import DateTime, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -27,4 +27,6 @@ class IpCam(Base):
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     rtsp_url: Mapped[str] = mapped_column(String(500), nullable=False)
     stream_key: Mapped[str] = mapped_column(String(100), nullable=False, unique=True, default=_generate_stream_key)
+    # 카메라별 바닥 homography + 기립 스케일. API가 검증한 canonical JSON만 저장한다.
+    posture_calibration: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

@@ -1,7 +1,7 @@
-"""Ip CAM CRUD characterization + 16대 cap (net-new) 테스트.
+"""Ip CAM CRUD characterization + 제품 카메라 cap 테스트.
 
 CRUD list/create/update/delete/stats 는 추출 코드의 기존 동작을 고정(characterization).
-16대 cap 은 net-new 로직 → 명시적 경계 테스트(16 OK, 17번째 409).
+등록 cap 은 net-new 로직 → 명시적 경계 테스트(MAX_IPCAMS OK, 다음 등록 409).
 """
 
 import os
@@ -115,6 +115,67 @@ def test_delete_removes_cam(client):
 def test_delete_missing_returns_404(client):
     resp = client.delete("/api/ipcams/999")
     assert resp.status_code == 404
+
+
+# ─── 카메라별 바닥/원근 posture 보정 ───
+
+
+def _calibration_payload():
+    return {
+        "frame_width": 1000,
+        "frame_height": 1000,
+        "floor_image_points": [[0, 0], [1000, 0], [1000, 1000], [0, 1000]],
+        "floor_world_points": [[0, 0], [4, 0], [4, 4], [0, 4]],
+        "standing_references": [
+            {"foot_px": [500, 800], "keypoint_height_px": 600, "height_m": 1.7},
+            {"foot_px": [500, 600], "keypoint_height_px": 500, "height_m": 1.7},
+            {"foot_px": [500, 400], "keypoint_height_px": 400, "height_m": 1.7},
+        ],
+    }
+
+
+def test_calibration_put_get_delete_round_trip(client):
+    cam = client.post(
+        "/api/ipcams", json={"name": "보정", "rtsp_url": "rtsp://x/calibration"}
+    ).json()
+    endpoint = f"/api/ipcams/{cam['id']}/calibration"
+
+    saved = client.put(endpoint, json=_calibration_payload())
+    assert saved.status_code == 200
+    assert saved.json()["enabled"] is True
+    assert saved.json()["calibration"] == _calibration_payload()
+
+    loaded = client.get(endpoint)
+    assert loaded.status_code == 200
+    assert loaded.json() == saved.json()
+
+    cleared = client.delete(endpoint)
+    assert cleared.status_code == 204
+    assert client.get(endpoint).json() == {"enabled": False, "calibration": None}
+
+
+def test_calibration_rejects_degenerate_floor_points(client):
+    cam = client.post(
+        "/api/ipcams", json={"name": "보정", "rtsp_url": "rtsp://x/calibration"}
+    ).json()
+    payload = _calibration_payload()
+    payload["floor_world_points"] = [[0, 0], [1, 0], [2, 0], [3, 0]]
+
+    response = client.put(f"/api/ipcams/{cam['id']}/calibration", json=payload)
+
+    assert response.status_code == 422
+    assert client.get(f"/api/ipcams/{cam['id']}/calibration").json() == {
+        "enabled": False,
+        "calibration": None,
+    }
+
+
+def test_calibration_missing_camera_returns_404(client):
+    assert client.get("/api/ipcams/999/calibration").status_code == 404
+    assert client.put(
+        "/api/ipcams/999/calibration", json=_calibration_payload()
+    ).status_code == 404
+    assert client.delete("/api/ipcams/999/calibration").status_code == 404
 
 
 # ─── net-new: mediamtx 사이드이펙트 배선 (test-first) ───
@@ -294,7 +355,7 @@ def test_stats_invokes_ensure_stream_selfheal(client, mtx):
     assert mtx["ensure"].call_args.args[1] == cam["stream_key"]
 
 
-# ─── net-new: 16대 cap (test-first) ───
+# ─── net-new: 제품 등록 cap (test-first) ───
 
 
 def test_can_register_up_to_max_ipcams(client):

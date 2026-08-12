@@ -21,8 +21,9 @@ load_dotenv(_root_env)
 #   MAX_IPCAMS="" → int("") → ValueError(import 크래시). `or` 로 빈값=거짓 → 기본값 폴백.
 CORS_ORIGINS: str = os.getenv("CORS_ORIGINS") or "*"
 
-_raw_max_ipcams = int(os.getenv("MAX_IPCAMS") or "16")
-MAX_IPCAMS: int = max(1, min(64, _raw_max_ipcams))
+PRODUCT_MAX_IPCAMS = 2
+_raw_max_ipcams = int(os.getenv("MAX_IPCAMS") or str(PRODUCT_MAX_IPCAMS))
+MAX_IPCAMS: int = max(1, min(PRODUCT_MAX_IPCAMS, _raw_max_ipcams))
 
 # mediamtx API 주소 — 미설정/빈값이면 import 시점에 즉시 fail-fast (원본 deepeye 동작 복원).
 # 빈값을 허용하면 stats/delete/lifespan 의 mediamtx 호출이 호출 시점마다 산발적
@@ -137,7 +138,12 @@ def setup_logging() -> logging.Logger:
 logger = setup_logging()
 
 if _raw_max_ipcams != MAX_IPCAMS:
-    logger.warning("MAX_IPCAMS=%d → %d 로 보정됨 (허용 범위: 1~64)", _raw_max_ipcams, MAX_IPCAMS)
+    logger.warning(
+        "MAX_IPCAMS=%d → %d 로 보정됨 (제품 허용 범위: 1~%d)",
+        _raw_max_ipcams,
+        MAX_IPCAMS,
+        PRODUCT_MAX_IPCAMS,
+    )
 for _w in (_conf_warn,):
     if _w:
         logger.warning("%s", _w)

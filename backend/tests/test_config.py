@@ -27,9 +27,9 @@ def _reload_config(monkeypatch, **env):
     return importlib.reload(app.config)
 
 
-def test_empty_max_ipcams_falls_back_to_16(monkeypatch):
+def test_empty_max_ipcams_falls_back_to_product_limit_two(monkeypatch):
     config = _reload_config(monkeypatch, MAX_IPCAMS="")
-    assert config.MAX_IPCAMS == 16
+    assert config.MAX_IPCAMS == 2
 
 
 def test_empty_cors_origins_falls_back_to_star(monkeypatch):
@@ -40,12 +40,17 @@ def test_empty_cors_origins_falls_back_to_star(monkeypatch):
 def test_both_empty_imports_without_crash(monkeypatch):
     """둘 다 빈값이어도 import(=reload) 가 ValueError 없이 통과 + 안전기본 적용."""
     config = _reload_config(monkeypatch, MAX_IPCAMS="", CORS_ORIGINS="")
-    assert config.MAX_IPCAMS == 16
+    assert config.MAX_IPCAMS == 2
     assert config.CORS_ORIGINS == "*"
 
 
-def test_set_values_are_respected(monkeypatch):
-    """빈값이 아니면 실제 값을 쓴다(폴백이 정상값을 덮지 않는다)."""
+def test_set_values_are_clamped_to_product_limit(monkeypatch):
+    """환경변수가 더 커도 제품 상한인 2대를 넘길 수 없다."""
     config = _reload_config(monkeypatch, MAX_IPCAMS="32", CORS_ORIGINS="http://example.com:5182")
-    assert config.MAX_IPCAMS == 32
+    assert config.MAX_IPCAMS == 2
     assert config.CORS_ORIGINS == "http://example.com:5182"
+
+
+def test_lower_max_ipcams_value_is_respected(monkeypatch):
+    config = _reload_config(monkeypatch, MAX_IPCAMS="1")
+    assert config.MAX_IPCAMS == 1

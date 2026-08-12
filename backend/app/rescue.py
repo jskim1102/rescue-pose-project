@@ -2,6 +2,8 @@
 
 규칙(U1): 한 사람의 posture 가 `lying` 로 **연속 ≥ N초**(기본 10, env knob) 지속되면 needs-rescue.
 단위 = 사람. lying-즉시·넘어짐 전이 감지 없음. 알림은 UI 전용(U2, 여기선 상태만 산출).
+standing↔sitting 은 0.4초 지속 확인 후 전환해 경계값 흔들림을 UI에서 제거한다. lying 관련 전환은
+구조 안전과 연속시간 정확성을 위해 즉시 반영한다.
 
 사람 식별(D5): worker 는 track ID 없이 plain `model(frame)` — lineage parity 로 worker 추론 경로를
 건드리지 않는다. 대신 여기서 프레임별 사람 detection 을 **centroid 최근접 association** 으로 track 에
@@ -35,6 +37,9 @@ DEFAULT_LYING_THRESHOLD_S: float = _env_float("RESCUE_LYING_THRESHOLD_S", 10.0)
 DEFAULT_EXPIRY_S: float = _env_float("RESCUE_EXPIRY_S", 3.0)
 # centroid 연관 최대 거리 = 프레임 대각선 × 이 비율. 정지한 누운 사람엔 충분히 넉넉.
 DEFAULT_MATCH_FRACTION: float = 0.2
+# sitting/standing 경계에서 같은 자세가 이 시간 이상 이어져야 라벨을 전환한다.
+# lying 진입/해제는 구조 안전을 위해 이 지연을 우회한다.
+DEFAULT_POSTURE_STABILITY_S: float = 0.4
 
 # centroid 에 포함할 keypoint 최소 conf(c > 이 값). worker 가 이미 사람 conf 를 적용하므로 0.
 _MIN_KP_CONF = 0.0
@@ -46,6 +51,7 @@ class PersonRescue:
 
     rescue_needed: bool
     lying_sec: float  # 현재 연속 lying 지속(초). lying 아니면 0.0.
+    posture: Optional[str]  # 사람별 흔들림을 제거한 최종 posture.
 
 
 @dataclass
@@ -54,6 +60,9 @@ class _Track:
     cy: float
     lying_since: Optional[float]  # 연속 lying 시작 시각(now 단위). lying 아니면 None.
     last_seen: float
+    posture: Optional[str]
+    candidate_posture: Optional[str] = None
+    candidate_since: Optional[float] = None
     rescue_active: bool = False  # 현재 needs-rescue 상태(종료 사유 판별용: 회복 vs 소실).
 
 
@@ -77,15 +86,50 @@ class RescueTracker:
         lying_threshold_s: float = DEFAULT_LYING_THRESHOLD_S,
         expiry_s: float = DEFAULT_EXPIRY_S,
         match_fraction: float = DEFAULT_MATCH_FRACTION,
+        posture_stability_s: float = DEFAULT_POSTURE_STABILITY_S,
         now: Callable[[], float] = time.monotonic,
     ) -> None:
         self._threshold = lying_threshold_s
         self._expiry = expiry_s
         self._match_fraction = match_fraction
+        self._posture_stability = max(0.0, posture_stability_s)
         self._now = now
         self._tracks: list[_Track] = []
         # needs-rescue track 종료 이벤트("recovered"=기립). update 마다 누적, drain 으로 소비.
         self._pending_events: list[str] = []
+
+    def _stabilize_posture(
+        self,
+        track: _Track,
+        raw_posture: Optional[str],
+        now: float,
+    ) -> Optional[str]:
+        """standing↔sitting만 지속시간 확인. lying 관련 전환은 즉시 반영한다."""
+        if raw_posture == track.posture:
+            track.candidate_posture = None
+            track.candidate_since = None
+            return track.posture
+
+        stable_pair = {raw_posture, track.posture} <= {"standing", "sitting"}
+        if not stable_pair or self._posture_stability == 0:
+            track.posture = raw_posture
+            track.candidate_posture = None
+            track.candidate_since = None
+            return track.posture
+
+        if track.candidate_posture != raw_posture:
+            track.candidate_posture = raw_posture
+            track.candidate_since = now
+            return track.posture
+
+        if (
+            track.candidate_since is not None
+            and (now - track.candidate_since) >= self._posture_stability
+        ):
+            track.posture = raw_posture
+            track.candidate_posture = None
+            track.candidate_since = None
+        return track.posture
 
     def update(self, persons, frame_w: float = 0.0, frame_h: float = 0.0) -> list[PersonRescue]:
         """이번 프레임의 사람 detection 을 처리 → 입력 순서에 정렬된 PersonRescue 리스트.
@@ -129,7 +173,6 @@ class RescueTracker:
         # 3) track 갱신/생성 + 연속 lying 누적 → 상태.
         states: list[PersonRescue] = []
         for i in range(len(persons)):
-            lying = postures[i] == "lying"
             ci = cents[i]
             j = person_track[i]
             if j is not None:
@@ -137,6 +180,8 @@ class RescueTracker:
                 if ci is not None:
                     tr.cx, tr.cy = ci
                 tr.last_seen = t
+                posture = self._stabilize_posture(tr, postures[i], t)
+                lying = posture == "lying"
                 if lying:
                     if tr.lying_since is None:  # lying 시작 — 누적 개시
                         tr.lying_since = t
@@ -146,7 +191,15 @@ class RescueTracker:
             else:
                 # 신규 사람 — track 생성. centroid 없으면 원점 취급(무 keypoint 엣지).
                 cx, cy = ci if ci is not None else (0.0, 0.0)
-                tr = _Track(cx=cx, cy=cy, lying_since=(t if lying else None), last_seen=t)
+                posture = postures[i]
+                lying = posture == "lying"
+                tr = _Track(
+                    cx=cx,
+                    cy=cy,
+                    lying_since=(t if lying else None),
+                    last_seen=t,
+                    posture=posture,
+                )
                 self._tracks.append(tr)
 
             lying_sec = (t - tr.lying_since) if tr.lying_since is not None else 0.0
@@ -157,7 +210,13 @@ class RescueTracker:
             elif not needed and tr.rescue_active:
                 self._pending_events.append("recovered")
                 tr.rescue_active = False
-            states.append(PersonRescue(rescue_needed=needed, lying_sec=lying_sec))
+            states.append(
+                PersonRescue(
+                    rescue_needed=needed,
+                    lying_sec=lying_sec,
+                    posture=posture,
+                )
+            )
         return states
 
     def drain_events(self) -> list[str]:
