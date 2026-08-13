@@ -8,7 +8,10 @@ import {
   convexHullPoints,
   floorWorldPointsFromAnchorDistances,
   mapClientPointToVideo,
-  selectStandingReferenceAtPoint,
+  parsePostureCalibrationDraft,
+  postureCalibrationDraftStorageKey,
+  standingReferenceFromSinglePerson,
+  type PostureCalibrationDraft,
 } from "../src/utils/postureCalibration.ts";
 
 
@@ -118,51 +121,102 @@ test("임의 순서 기준점은 바닥 적용 영역을 이루는 외곽선 순
 });
 
 
-test("화면에서 클릭한 기립자의 발 위치와 keypoint 길이를 자동 추출한다", () => {
+test("화면에 한 명만 검출되면 그 사람의 발 위치와 keypoint 길이를 자동 추출한다", () => {
   const empty = () => [0, 0, 0] as [number, number, number];
-  const first = Array.from({ length: 17 }, empty);
-  first[0] = [100, 100, 0.9];
-  first[5] = [90, 200, 0.9];
-  first[6] = [110, 200, 0.9];
-  first[11] = [92, 300, 0.9];
-  first[12] = [108, 300, 0.9];
-  first[13] = [94, 400, 0.9];
-  first[14] = [106, 400, 0.9];
-  first[15] = [96, 500, 0.9];
-  first[16] = [104, 500, 0.9];
+  const keypoints = Array.from({ length: 17 }, empty);
+  keypoints[0] = [100, 100, 0.9];
+  keypoints[5] = [90, 200, 0.9];
+  keypoints[6] = [110, 200, 0.9];
+  keypoints[11] = [92, 300, 0.9];
+  keypoints[12] = [108, 300, 0.9];
+  keypoints[13] = [94, 400, 0.9];
+  keypoints[14] = [106, 400, 0.9];
+  keypoints[15] = [96, 500, 0.9];
+  keypoints[16] = [104, 500, 0.9];
 
-  const second = first.map(([x, y, confidence]) => [x + 300, y, confidence] as [number, number, number]);
-  const reference = selectStandingReferenceAtPoint(
-    [
-      { keypoints: first },
-      { keypoints: second },
-    ],
-    [800, 337.5],
+  const reference = standingReferenceFromSinglePerson(
+    [{ keypoints }],
     { frameWidth: 640, frameHeight: 640 },
     { calibrationWidth: 1280, calibrationHeight: 720 },
     1.72,
   );
 
   assert.ok(reference);
-  assert.deepEqual(reference.foot_px, [800, 562.5]);
+  assert.deepEqual(reference.foot_px, [200, 562.5]);
   assert.equal(reference.height_m, 1.72);
   assert.ok(reference.keypoint_height_px > 450);
 });
 
 
-test("발목이 보이지 않는 사람은 기립 기준으로 저장하지 않는다", () => {
+test("검출 인원이 0명 또는 2명 이상이면 기립 기준 대상을 선택하지 않는다", () => {
+  const keypoints = Array.from(
+    { length: 17 },
+    (_, index) => [100, 100 + index * 10, 0.9] as [number, number, number],
+  );
+  const frame = { frameWidth: 640, frameHeight: 640 };
+  const calibration = { calibrationWidth: 640, calibrationHeight: 640 };
+
+  assert.equal(standingReferenceFromSinglePerson([], frame, calibration, 1.7), null);
+  assert.equal(
+    standingReferenceFromSinglePerson(
+      [{ keypoints }, { keypoints }],
+      frame,
+      calibration,
+      1.7,
+    ),
+    null,
+  );
+});
+
+
+test("한 명이 검출돼도 발목이 보이지 않으면 기립 기준으로 저장하지 않는다", () => {
   const keypoints = Array.from(
     { length: 17 },
     (_, index) => [100, 100 + index * 10, index < 15 ? 0.9 : 0] as [number, number, number],
   );
   assert.equal(
-    selectStandingReferenceAtPoint(
+    standingReferenceFromSinglePerson(
       [{ keypoints }],
-      [100, 180],
       { frameWidth: 640, frameHeight: 640 },
       { calibrationWidth: 640, calibrationHeight: 640 },
       1.7,
     ),
+    null,
+  );
+});
+
+
+test("카메라별 보정 초안을 브라우저 저장값에서 안전하게 복원한다", () => {
+  const draft: PostureCalibrationDraft = {
+    version: 1,
+    step: "standing",
+    frameSize: { width: 1920, height: 1080 },
+    floorPoints: [[120, 920], [420, 520], [1500, 520], [1800, 920]],
+    anchorDistanceInputs: { ab: "3.00", ac: "6.00", bc: "5.20", ad: "7.00", bd: "4.50" },
+    personHeightM: "1.77",
+    standingReferences: [
+      { foot_px: [800, 820], keypoint_height_px: 420, height_m: 1.77 },
+    ],
+  };
+
+  assert.deepEqual(parsePostureCalibrationDraft(JSON.stringify(draft)), draft);
+  assert.notEqual(postureCalibrationDraftStorageKey(1), postureCalibrationDraftStorageKey(2));
+});
+
+
+test("손상되거나 지원하지 않는 보정 초안은 복원하지 않는다", () => {
+  assert.equal(parsePostureCalibrationDraft("not-json"), null);
+  assert.equal(parsePostureCalibrationDraft(JSON.stringify({ version: 2 })), null);
+  assert.equal(
+    parsePostureCalibrationDraft(JSON.stringify({
+      version: 1,
+      step: "floor",
+      frameSize: { width: 1920, height: 1080 },
+      floorPoints: [[0, 0], [1, 0], [1, 1], [0, 1], [2, 2]],
+      anchorDistanceInputs: { ab: "1", ac: "1", bc: "1", ad: "1", bd: "1" },
+      personHeightM: "1.70",
+      standingReferences: [],
+    })),
     null,
   );
 });

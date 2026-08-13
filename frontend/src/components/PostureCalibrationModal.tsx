@@ -7,9 +7,12 @@ import {
   convexHullPoints,
   floorWorldPointsFromAnchorDistances,
   mapClientPointToVideo,
-  selectStandingReferenceAtPoint,
+  parsePostureCalibrationDraft,
+  postureCalibrationDraftStorageKey,
+  standingReferenceFromSinglePerson,
   type CalibrationPoint,
   type FloorAnchorDistances,
+  type PostureCalibrationDraft,
   type PostureCalibrationPayload,
   type StandingReferencePayload,
 } from "../utils/postureCalibration";
@@ -127,8 +130,36 @@ function PostureCalibrationModal({
   const [enabled, setEnabled] = useState(false);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [draftReady, setDraftReady] = useState(false);
+  const [draftDirty, setDraftDirty] = useState(false);
   const [message, setMessage] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
   const { items, frameW, frameH } = useDetectionWs(streamKey, open && inferenceActive);
+  const draftStorageKey = postureCalibrationDraftStorageKey(cameraId);
+
+  const currentDraft = (): PostureCalibrationDraft => ({
+    version: 1,
+    step,
+    frameSize,
+    floorPoints,
+    anchorDistanceInputs,
+    personHeightM,
+    standingReferences,
+  });
+
+  const persistCurrentDraft = (): boolean => {
+    if (!draftReady || !draftDirty) return true;
+    try {
+      window.localStorage.setItem(draftStorageKey, JSON.stringify(currentDraft()));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const closeAndPersist = () => {
+    persistCurrentDraft();
+    onClose();
+  };
 
   useEffect(() => {
     const video = videoRef.current;
@@ -150,8 +181,29 @@ function PostureCalibrationModal({
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
+    let draft: PostureCalibrationDraft | null = null;
+    setDraftReady(false);
+    setDraftDirty(false);
     setLoading(true);
     setMessage(null);
+    try {
+      const rawDraft = window.localStorage.getItem(draftStorageKey);
+      draft = parsePostureCalibrationDraft(rawDraft);
+      if (rawDraft && !draft) window.localStorage.removeItem(draftStorageKey);
+    } catch {
+      draft = null;
+    }
+
+    const applyDraft = (storedDraft: PostureCalibrationDraft) => {
+      setStep(storedDraft.step);
+      setFrameSize(storedDraft.frameSize);
+      setFloorPoints(storedDraft.floorPoints);
+      setAnchorDistanceInputs(storedDraft.anchorDistanceInputs);
+      setPersonHeightM(storedDraft.personHeightM);
+      setStandingReferences(storedDraft.standingReferences);
+      setDraftDirty(true);
+    };
+
     fetch(`${apiBase()}/api/ipcams/${cameraId}/calibration`)
       .then(async (response) => {
         if (!response.ok) throw new Error(await responseDetail(response, "보정값을 불러오지 못했습니다"));
@@ -160,7 +212,20 @@ function PostureCalibrationModal({
       .then((state) => {
         if (cancelled) return;
         setEnabled(state.enabled);
-        if (!state.calibration) return;
+        if (draft) {
+          applyDraft(draft);
+          setMessage({ kind: "ok", text: "임시 저장된 보정 작업을 복원했습니다" });
+          return;
+        }
+        setStep("floor");
+        setFloorPoints([]);
+        setAnchorDistanceInputs(EMPTY_ANCHOR_DISTANCES);
+        setPersonHeightM("1.70");
+        setStandingReferences([]);
+        if (!state.calibration) {
+          setFrameSize(null);
+          return;
+        }
         const calibration = state.calibration;
         setFrameSize({ width: calibration.frame_width, height: calibration.frame_height });
         setFloorPoints(calibration.floor_image_points.slice(0, 4));
@@ -169,17 +234,44 @@ function PostureCalibrationModal({
         setPersonHeightM(calibration.standing_references[0]?.height_m.toFixed(2) ?? "1.70");
       })
       .catch((error: unknown) => {
-        if (!cancelled) {
-          setMessage({ kind: "error", text: error instanceof Error ? error.message : "보정값을 불러오지 못했습니다" });
-        }
+        if (cancelled) return;
+        if (draft) applyDraft(draft);
+        setMessage({
+          kind: draft ? "ok" : "error",
+          text: draft
+            ? "서버 보정값을 불러오지 못했지만 임시 저장 작업은 복원했습니다"
+            : error instanceof Error ? error.message : "보정값을 불러오지 못했습니다",
+        });
       })
       .finally(() => {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) {
+          setLoading(false);
+          setDraftReady(true);
+        }
       });
     return () => {
       cancelled = true;
     };
-  }, [open, cameraId]);
+  }, [open, cameraId, draftStorageKey]);
+
+  useEffect(() => {
+    if (!open || loading || !draftReady || !draftDirty) return;
+    if (!persistCurrentDraft()) {
+      setMessage({ kind: "error", text: "보정 작업을 브라우저에 임시 저장하지 못했습니다" });
+    }
+  }, [
+    open,
+    loading,
+    draftReady,
+    draftDirty,
+    draftStorageKey,
+    step,
+    frameSize,
+    floorPoints,
+    anchorDistanceInputs,
+    personHeightM,
+    standingReferences,
+  ]);
 
   // 새 보정은 현재 WHEP 원본 해상도를 좌표계로 쓴다. 기존 보정은 저장된 좌표계를 유지한다.
   useEffect(() => {
@@ -201,6 +293,27 @@ function PostureCalibrationModal({
     }
   }
   const floorHull = convexHullPoints(floorPoints);
+  const heightM = Number(personHeightM);
+  const validPersonHeight = Number.isFinite(heightM) && heightM >= 0.5 && heightM <= 2.5;
+  const detectedStandingReference = (
+    inferenceActive
+    && items.length === 1
+    && frameSize
+    && validPersonHeight
+  ) ? standingReferenceFromSinglePerson(
+      items,
+      { frameWidth: frameW, frameHeight: frameH },
+      { calibrationWidth: frameSize.width, calibrationHeight: frameSize.height },
+      heightM,
+    ) : null;
+  const standingReferenceInsideFloor = Boolean(
+    detectedStandingReference && pointInPolygon(detectedStandingReference.foot_px, floorHull),
+  );
+  const canRecordStanding = (
+    Boolean(detectedStandingReference)
+    && standingReferenceInsideFloor
+    && standingReferences.length < 20
+  );
 
   const setError = (text: string) => setMessage({ kind: "error", text });
 
@@ -220,51 +333,48 @@ function PostureCalibrationModal({
     ];
   };
 
-  const handleVideoClick = (event: React.MouseEvent<SVGSVGElement>) => {
+  const handleFloorVideoClick = (event: React.MouseEvent<SVGSVGElement>) => {
     const point = clickedCalibrationPoint(event);
     if (!point || !frameSize) {
       setError("검은 여백이 아니라 실제 영상 안을 클릭하세요");
       return;
     }
-    if (step === "floor") {
-      if (floorPoints.length >= 4) {
-        setError("바닥점 4개를 이미 찍었습니다. 다시 찍기를 누르면 수정할 수 있습니다");
-        return;
-      }
-      setFloorPoints((current) => [...current, point]);
-      setMessage(null);
+    if (floorPoints.length >= 4) {
+      setError("바닥점 4개를 이미 찍었습니다. 다시 찍기를 누르면 수정할 수 있습니다");
       return;
     }
+    setFloorPoints((current) => [...current, point]);
+    setDraftDirty(true);
+    setMessage(null);
+  };
 
+  const recordStandingReference = () => {
     if (!inferenceActive) {
-      setError("사람을 자동 선택하려면 먼저 추론을 켜세요");
+      setError("기립 자세를 기록하려면 먼저 추론을 켜세요");
       return;
     }
-    const heightM = Number(personHeightM);
-    if (!Number.isFinite(heightM) || heightM < 0.5 || heightM > 2.5) {
+    if (items.length !== 1) {
+      setError(items.length === 0 ? "화면에 기준 사람 한 명이 보이게 서 주세요" : "다른 사람이 화면에서 나간 뒤 기록하세요");
+      return;
+    }
+    if (!validPersonHeight) {
       setError("기준 사람의 실제 키를 0.5~2.5m로 입력하세요");
       return;
     }
-    const reference = selectStandingReferenceAtPoint(
-      items,
-      point,
-      { frameWidth: frameW, frameHeight: frameH },
-      { calibrationWidth: frameSize.width, calibrationHeight: frameSize.height },
-      heightM,
-    );
-    if (!reference) {
-      setError("사람의 몸을 클릭하세요. 발목을 포함한 키포인트가 보여야 합니다");
+    if (!detectedStandingReference) {
+      setError("기준 사람의 발목을 포함한 전신 키포인트가 보여야 합니다");
       return;
     }
-    if (!pointInPolygon(reference.foot_px, floorHull)) {
-      setError("선택한 사람의 발이 지정한 바닥 영역 밖에 있습니다");
+    if (!standingReferenceInsideFloor) {
+      setError("기준 사람의 발이 지정한 바닥 영역 안에 있어야 합니다");
       return;
     }
     if (standingReferences.length >= 20) {
       setError("기립 기준은 최대 20개까지 저장할 수 있습니다");
       return;
     }
-    setStandingReferences((current) => [...current, reference]);
+    setStandingReferences((current) => [...current, detectedStandingReference]);
+    setDraftDirty(true);
     setMessage({ kind: "ok", text: `기립 위치 ${standingReferences.length + 1} 기록됨` });
   };
 
@@ -275,7 +385,7 @@ function PostureCalibrationModal({
       floorPoints,
       numericAnchorDistances(anchorDistanceInputs),
     );
-    if (standingReferences.length < 3) throw new Error("같은 사람이 서로 다른 세 위치에 섰을 때 각각 클릭하세요");
+    if (standingReferences.length < 3) throw new Error("같은 사람이 서로 다른 세 위치에 섰을 때 각각 기록하세요");
     return {
       frame_width: frameSize.width,
       frame_height: frameSize.height,
@@ -286,7 +396,7 @@ function PostureCalibrationModal({
   };
 
   const save = async () => {
-    if (saving) return;
+    if (step !== "standing" || saving) return;
     let payload: PostureCalibrationPayload;
     try {
       payload = buildPayload();
@@ -304,6 +414,12 @@ function PostureCalibrationModal({
       if (!response.ok) throw new Error(await responseDetail(response, "보정값 저장에 실패했습니다"));
       const state = await response.json() as CalibrationState;
       setEnabled(state.enabled);
+      try {
+        window.localStorage.removeItem(draftStorageKey);
+      } catch {
+        // 저장된 서버 보정값이 정본이므로 브라우저 저장소 정리 실패는 적용을 막지 않는다.
+      }
+      setDraftDirty(false);
       setMessage({ kind: "ok", text: "저장됨 — 다음 추론 프레임부터 적용됩니다" });
     } catch (error) {
       setError(error instanceof Error ? error.message : "보정값 저장에 실패했습니다");
@@ -324,8 +440,15 @@ function PostureCalibrationModal({
       setFrameSize(videoSize);
       setFloorPoints([]);
       setAnchorDistanceInputs(EMPTY_ANCHOR_DISTANCES);
+      setPersonHeightM("1.70");
       setStandingReferences([]);
       setStep("floor");
+      try {
+        window.localStorage.removeItem(draftStorageKey);
+      } catch {
+        // 서버 초기화는 성공했으므로 브라우저 저장소 정리 실패와 분리한다.
+      }
+      setDraftDirty(false);
       setMessage({ kind: "ok", text: "초기화됨 — 기존 keypoint 판정으로 복귀했습니다" });
     } catch (error) {
       setError(error instanceof Error ? error.message : "보정 초기화에 실패했습니다");
@@ -338,21 +461,22 @@ function PostureCalibrationModal({
   const nextFloorPoint = FLOOR_POINT_LABELS[floorPoints.length];
 
   return (
-    <Modal open={open} onClose={onClose} title={`바닥·원근 보정 · ${cameraName}`} maxWidth={1120}>
+    <Modal open={open} onClose={closeAndPersist} title={`바닥·원근 보정 · ${cameraName}`} maxWidth={1120}>
       <div style={styles.root}>
         <div style={styles.topline}>
           <div style={styles.status}>
             <span style={{ ...styles.dot, background: enabled ? "#3fb950" : "#8b95a5" }} />
             {enabled ? "보정 적용 중" : "보정 미설정"}
+            {draftDirty && <span style={styles.draftBadge}>임시 저장됨</span>}
           </div>
           <div style={styles.steps}>
-            <button style={{ ...styles.stepButton, ...(step === "floor" ? styles.stepButtonActive : {}) }} onClick={() => setStep("floor")}>
+            <button style={{ ...styles.stepButton, ...(step === "floor" ? styles.stepButtonActive : {}) }} onClick={() => { setStep("floor"); setDraftDirty(true); }}>
               1. 바닥 기준점 {floorPoints.length}/4
             </button>
             <button
               style={{ ...styles.stepButton, ...(step === "standing" ? styles.stepButtonActive : {}), ...(computedFloorWorldPoints ? {} : styles.disabled) }}
               disabled={!computedFloorWorldPoints}
-              onClick={() => setStep("standing")}
+              onClick={() => { setStep("standing"); setDraftDirty(true); }}
             >
               2. 기립 기준 {standingReferences.length}/3+
             </button>
@@ -374,8 +498,12 @@ function PostureCalibrationModal({
                   aria-label="카메라 보정 좌표 선택 화면"
                   viewBox={`0 0 ${frameSize.width} ${frameSize.height}`}
                   preserveAspectRatio="xMidYMid meet"
-                  onClick={handleVideoClick}
-                  style={styles.clickOverlay}
+                  onClick={step === "floor" ? handleFloorVideoClick : undefined}
+                  style={{
+                    ...styles.clickOverlay,
+                    cursor: step === "floor" ? "crosshair" : "default",
+                    pointerEvents: step === "floor" ? "auto" : "none",
+                  }}
                 >
                   {floorHull.length >= 3 && (
                     <polygon points={polygonPoints} fill="rgba(68,147,248,0.14)" stroke="#4493f8" strokeWidth={Math.max(2, frameSize.width / 700)} />
@@ -451,6 +579,7 @@ function PostureCalibrationModal({
                             value={anchorDistanceInputs[field.key]}
                             onChange={(event) => {
                               setAnchorDistanceInputs((current) => ({ ...current, [field.key]: event.target.value }));
+                              setDraftDirty(true);
                               setMessage(null);
                             }}
                             placeholder="0.00"
@@ -461,11 +590,11 @@ function PostureCalibrationModal({
                   </div>
                 </div>
                 <div style={styles.inlineActions}>
-                  <button style={styles.secondaryButton} onClick={() => { setFloorPoints([]); setAnchorDistanceInputs(EMPTY_ANCHOR_DISTANCES); setStandingReferences([]); setMessage(null); }}>다시 찍기</button>
+                  <button style={styles.secondaryButton} onClick={() => { setFloorPoints([]); setAnchorDistanceInputs(EMPTY_ANCHOR_DISTANCES); setStandingReferences([]); setDraftDirty(true); setMessage(null); }}>다시 찍기</button>
                   <button
                     style={{ ...styles.primaryButton, ...(computedFloorWorldPoints ? {} : styles.disabled) }}
                     disabled={!computedFloorWorldPoints}
-                    onClick={() => setStep("standing")}
+                    onClick={() => { setStep("standing"); setDraftDirty(true); }}
                   >
                     기립 기준으로
                   </button>
@@ -483,22 +612,34 @@ function PostureCalibrationModal({
             ) : (
               <>
                 <div>
-                  <h3 style={styles.heading}>같은 사람을 세 위치에서 클릭</h3>
+                  <h3 style={styles.heading}>한 명만 보이게 한 뒤 버튼으로 기록</h3>
                   <p style={styles.help}>
-                    사람이 가까운 곳·중간·먼 곳으로 이동해 똑바로 설 때마다 영상 속 몸을 한 번 클릭하세요. 발 위치와 keypoint 길이는 자동으로 기록됩니다.
+                    기준 사람 외에는 화면에서 나가 주세요. 가까운 곳·중간·먼 곳으로 이동해 똑바로 설 때마다 아래 기록 버튼을 누르면 발 위치와 keypoint 길이가 저장됩니다.
                   </p>
                 </div>
                 <label style={styles.field}>
                   <span style={styles.label}>기준 사람 실제 키 (m)</span>
-                  <input style={styles.input} inputMode="decimal" value={personHeightM} onChange={(event) => { setPersonHeightM(event.target.value); setMessage(null); }} placeholder="1.70" />
+                  <input style={styles.input} inputMode="decimal" value={personHeightM} onChange={(event) => { setPersonHeightM(event.target.value); setDraftDirty(true); setMessage(null); }} placeholder="1.70" />
                 </label>
                 {!inferenceActive && (
                   <div style={styles.inferenceBox}>
-                    <span>{hasModels ? "사람을 선택하려면 키포인트 추론이 필요합니다." : "먼저 이 카메라에 pose 모델을 선택하세요."}</span>
+                    <span>{hasModels ? "기립 자세를 기록하려면 키포인트 추론이 필요합니다." : "먼저 이 카메라에 pose 모델을 선택하세요."}</span>
                     {hasModels && <button style={styles.primaryButton} onClick={onEnableInference}>추론 켜기</button>}
                   </div>
                 )}
                 {inferenceActive && items.length === 0 && <div style={styles.tip}>키포인트를 기다리는 중입니다. 사람이 전신으로 보이게 서 주세요.</div>}
+                {inferenceActive && items.length > 1 && <div style={styles.errorTip}>현재 {items.length}명이 검출됐습니다. 기준 사람 한 명만 화면에 남겨 주세요.</div>}
+                {inferenceActive && items.length === 1 && !validPersonHeight && <div style={styles.errorTip}>기준 사람의 실제 키를 0.5~2.5m로 입력하세요.</div>}
+                {inferenceActive && items.length === 1 && validPersonHeight && !detectedStandingReference && <div style={styles.tip}>한 명을 찾았습니다. 발목을 포함한 전신 키포인트가 보이게 서 주세요.</div>}
+                {inferenceActive && detectedStandingReference && !standingReferenceInsideFloor && <div style={styles.errorTip}>한 명을 찾았지만 발 위치가 지정한 바닥 영역 밖입니다.</div>}
+                {inferenceActive && canRecordStanding && <div style={styles.successTip}>한 명이 정상 검출됐습니다. 현재 위치를 기록할 수 있습니다.</div>}
+                <button
+                  style={{ ...styles.primaryButton, ...styles.recordButton, ...(canRecordStanding ? {} : styles.disabled) }}
+                  disabled={!canRecordStanding}
+                  onClick={recordStandingReference}
+                >
+                  현재 기립 자세 기록
+                </button>
                 <div style={styles.sampleList}>
                   {standingReferences.length === 0 ? (
                     <div style={styles.emptySamples}>아직 기록된 기립 위치가 없습니다</div>
@@ -508,7 +649,7 @@ function PostureCalibrationModal({
                       <button
                         aria-label={`기립 위치 ${index + 1} 삭제`}
                         style={styles.removeButton}
-                        onClick={() => setStandingReferences((current) => current.filter((_, itemIndex) => itemIndex !== index))}
+                        onClick={() => { setStandingReferences((current) => current.filter((_, itemIndex) => itemIndex !== index)); setDraftDirty(true); }}
                       >
                         삭제
                       </button>
@@ -530,8 +671,12 @@ function PostureCalibrationModal({
         )}
         <div style={styles.actions}>
           <button style={{ ...styles.secondaryButton, ...(enabled && !saving ? {} : styles.disabled) }} disabled={!enabled || saving} onClick={clear}>초기화</button>
-          <button style={styles.secondaryButton} disabled={saving} onClick={onClose}>닫기</button>
-          <button style={{ ...styles.primaryButton, ...(loading || saving ? styles.disabled : {}) }} disabled={loading || saving} onClick={save}>
+          <button style={styles.secondaryButton} disabled={saving} onClick={closeAndPersist}>닫기</button>
+          <button
+            style={{ ...styles.primaryButton, ...(step !== "standing" || loading || saving ? styles.disabled : {}) }}
+            disabled={step !== "standing" || loading || saving}
+            onClick={save}
+          >
             {saving ? "저장 중…" : "검증 후 저장"}
           </button>
         </div>
@@ -544,6 +689,7 @@ const styles: Record<string, React.CSSProperties> = {
   root: { display: "flex", flexDirection: "column", gap: "0.9rem" },
   topline: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "0.8rem", flexWrap: "wrap" },
   status: { display: "flex", alignItems: "center", gap: "0.45rem", fontSize: "0.82rem", fontWeight: 700 },
+  draftBadge: { padding: "0.16rem 0.42rem", borderRadius: 999, background: "rgba(68,147,248,0.12)", color: "#8fc1ff", fontSize: "0.66rem" },
   dot: { width: 8, height: 8, borderRadius: "50%" },
   steps: { display: "flex", gap: "0.4rem" },
   stepButton: { border: "1px solid #2a2f3a", background: "#11151c", color: "#8b95a5", borderRadius: 999, padding: "0.42rem 0.72rem", fontSize: "0.75rem", fontWeight: 700, cursor: "pointer" },
@@ -578,6 +724,7 @@ const styles: Record<string, React.CSSProperties> = {
   actions: { display: "flex", justifyContent: "flex-end", gap: "0.55rem", paddingTop: "0.1rem" },
   secondaryButton: { border: "1px solid #2a2f3a", background: "#161b24", color: "#e6edf3", borderRadius: 7, padding: "0.5rem 0.8rem", cursor: "pointer" },
   primaryButton: { border: "none", background: "#e5484d", color: "white", borderRadius: 7, padding: "0.5rem 0.9rem", fontWeight: 700, cursor: "pointer" },
+  recordButton: { width: "100%", padding: "0.7rem 0.9rem" },
   disabled: { opacity: 0.45, cursor: "default" },
 };
 

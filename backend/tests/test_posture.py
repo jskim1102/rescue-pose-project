@@ -156,6 +156,30 @@ def test_sitting_falls_back_to_hip_angle_when_ankles_are_occluded():
     assert _classify_posture(kpts) == "sitting"
 
 
+def test_sitting_uses_hip_angle_when_legs_are_extended_and_ankles_visible():
+    # 실측 이미지 3 회귀: 옆으로 앉아 다리를 앞으로 펴면 무릎각은 거의 180°지만,
+    # 직립 몸통과 앞으로 뻗은 허벅지가 골반에서 약 124~129°를 만든다.
+    kpts = _body(
+        shoulders=(_kp(576, 502), _kp(563, 526)),
+        hips=(_kp(603, 573), _kp(597, 589)),
+        knees=(_kp(654, 585), _kp(658, 600)),
+        ankles=(_kp(716, 608), _kp(718, 621)),
+    )
+    assert _classify_posture(kpts) == "sitting"
+
+
+def test_standing_with_one_raised_leg_is_not_mistaken_for_sitting():
+    # 한쪽 다리만 앞으로 든 직립자는 그쪽 골반각이 90°에 가까워도, 반대쪽 지지
+    # 다리가 펴져 있으므로 sitting 으로 바꾸지 않는다.
+    kpts = _body(
+        shoulders=(_kp(90, 100), _kp(110, 100)),
+        hips=(_kp(90, 200), _kp(110, 200)),
+        knees=(_kp(180, 200), _kp(110, 300)),
+        ankles=(_kp(270, 200), _kp(110, 400)),
+    )
+    assert _classify_posture(kpts) == "standing"
+
+
 def test_forward_bend_with_occluded_ankles_stays_standing():
     # 발목 누락 fallback 이 허리를 숙인 사람까지 sitting 으로 바꾸지 않아야 한다.
     kpts = _body(

@@ -812,11 +812,12 @@ def _model_worker_main(
             if getattr(prediction, "keypoints", None) is None:
                 detections = []
             else:
-                detections = [
+                parsed_detections = [
                     detection
                     for detection in _parse_results(prediction, model.names, model_name)
                     if detection.confidence >= threshold
                 ]
+                detections = _suppress_duplicate_pose_detections(parsed_detections)
             results.append(
                 InferenceResult(
                     source_id=request.source_id,
@@ -878,6 +879,143 @@ def _model_worker_main(
         idle_started = time.perf_counter()
 
     worker_logger.info("Model worker exiting: %s", model_name)
+
+
+def _box_iou(
+    first: tuple[int, int, int, int],
+    second: tuple[int, int, int, int],
+) -> float:
+    """두 box의 IoU. 잘못된/빈 box는 겹치지 않는 것으로 취급한다."""
+    left = max(first[0], second[0])
+    top = max(first[1], second[1])
+    right = min(first[2], second[2])
+    bottom = min(first[3], second[3])
+    intersection = max(0, right - left) * max(0, bottom - top)
+    first_area = max(0, first[2] - first[0]) * max(0, first[3] - first[1])
+    second_area = max(0, second[2] - second[0]) * max(0, second[3] - second[1])
+    union = first_area + second_area - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def _normalized_pose_distance(first: Detection, second: Detection) -> Optional[float]:
+    """box 크기와 무관한 대응 keypoint 거리의 중앙값.
+
+    유광 바닥 반사는 세로 방향으로 뒤집힌 포즈가 될 수 있어 일반 배치와 세로 반전
+    배치 중 가까운 값을 쓴다. 신뢰 가능한 공통 점이 부족하면 비교하지 않는다.
+    """
+    first_w = max(1, first.xyxy[2] - first.xyxy[0])
+    first_h = max(1, first.xyxy[3] - first.xyxy[1])
+    second_w = max(1, second.xyxy[2] - second.xyxy[0])
+    second_h = max(1, second.xyxy[3] - second.xyxy[1])
+    direct: list[float] = []
+    vertical_flip: list[float] = []
+    for first_point, second_point in zip(first.keypoints, second.keypoints):
+        if first_point[2] <= 0.3 or second_point[2] <= 0.3:
+            continue
+        first_x = (first_point[0] - first.xyxy[0]) / first_w
+        first_y = (first_point[1] - first.xyxy[1]) / first_h
+        second_x = (second_point[0] - second.xyxy[0]) / second_w
+        second_y = (second_point[1] - second.xyxy[1]) / second_h
+        direct.append(math.hypot(first_x - second_x, first_y - second_y))
+        vertical_flip.append(
+            math.hypot(first_x - second_x, first_y - (1.0 - second_y))
+        )
+    if len(direct) < 5:
+        return None
+
+    def median(values: list[float]) -> float:
+        ordered = sorted(values)
+        middle = len(ordered) // 2
+        if len(ordered) % 2:
+            return ordered[middle]
+        return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+    return min(median(direct), median(vertical_flip))
+
+
+def _is_duplicate_pose(lower: Detection, higher: Detection) -> bool:
+    """낮은 품질 detection이 같은 사람의 겹침/바닥 반사인지 보수적으로 판정한다."""
+    if lower.class_id != higher.class_id:
+        return False
+    pose_distance = _normalized_pose_distance(lower, higher)
+    if pose_distance is None or pose_distance > 0.12:
+        return False
+
+    # 같은 위치에 거의 같은 포즈를 다시 낸 일반 중복 detection.
+    if _box_iou(lower.xyxy, higher.xyxy) >= 0.75:
+        return True
+
+    lower_w = max(1, lower.xyxy[2] - lower.xyxy[0])
+    lower_h = max(1, lower.xyxy[3] - lower.xyxy[1])
+    higher_w = max(1, higher.xyxy[2] - higher.xyxy[0])
+    higher_h = max(1, higher.xyxy[3] - higher.xyxy[1])
+    width_similarity = min(lower_w, higher_w) / max(lower_w, higher_w)
+    height_similarity = min(lower_h, higher_h) / max(lower_h, higher_h)
+    horizontal_overlap = max(
+        0,
+        min(lower.xyxy[2], higher.xyxy[2])
+        - max(lower.xyxy[0], higher.xyxy[0]),
+    ) / min(lower_w, higher_w)
+    lower_center = (
+        (lower.xyxy[0] + lower.xyxy[2]) / 2.0,
+        (lower.xyxy[1] + lower.xyxy[3]) / 2.0,
+    )
+    higher_center = (
+        (higher.xyxy[0] + higher.xyxy[2]) / 2.0,
+        (higher.xyxy[1] + higher.xyxy[3]) / 2.0,
+    )
+    center_distance = math.hypot(
+        lower_center[0] - higher_center[0],
+        lower_center[1] - higher_center[1],
+    )
+    reference_diagonal = max(
+        math.hypot(lower_w, lower_h),
+        math.hypot(higher_w, higher_h),
+    )
+
+    # 실제 사람보다 훨씬 약하면서, 바로 아래에 같은 크기와 포즈로 잡힌 경우만
+    # 반사 중복으로 제거한다. 비슷한 confidence의 인접한 두 사람은 유지한다.
+    return (
+        lower.confidence <= higher.confidence * 0.65
+        and width_similarity >= 0.7
+        and height_similarity >= 0.7
+        and horizontal_overlap >= 0.75
+        and lower_center[1] > higher_center[1]
+        and center_distance <= reference_diagonal * 0.35
+    )
+
+
+def _suppress_duplicate_pose_detections(
+    detections: list[Detection],
+) -> list[Detection]:
+    """한 프레임에서 같은 사람을 가리키는 중복 pose를 하나로 축약한다.
+
+    confidence가 높은 결과부터 대표로 선택하되 반환 순서는 원래 detection 순서를
+    유지한다. 구조 우선순위/인원수/RescueTracker에 들어가기 전에 적용된다.
+    """
+    if len(detections) < 2:
+        return list(detections)
+
+    ranked_indices = sorted(
+        range(len(detections)),
+        key=lambda index: detections[index].confidence,
+        reverse=True,
+    )
+    kept_indices: list[int] = []
+    for index in ranked_indices:
+        candidate = detections[index]
+        if any(
+            _is_duplicate_pose(candidate, detections[kept_index])
+            for kept_index in kept_indices
+        ):
+            continue
+        kept_indices.append(index)
+    kept = set(kept_indices)
+    return [
+        detection
+        for index, detection in enumerate(detections)
+        if index in kept
+    ]
 
 
 def _parse_results(result, names, model_name: str = "") -> list[Detection]:
@@ -1039,6 +1177,20 @@ def _classify_posture(kpts: list[tuple[int, int, float]]) -> str:
         if knee[2] > min_confidence and ankle[2] > min_confidence
     ]
     if knee_angles and min(knee_angles) <= max_sitting_knee_angle:
+        return "sitting"
+
+    # 다리를 앞으로 펴고 앉으면 무릎각은 직선에 가까워 위 조건으로는 잡히지 않는다.
+    # 상체가 서 있고 보이는 모든 골반이 앉기 범위로 굽은 경우만 sitting 으로 본다.
+    # 한쪽 다리만 든 직립자는 반대쪽 골반각이 펴져 있으므로 이 조건을 통과하지 않는다.
+    if (
+        visible_ankles
+        and torso_angle > max_lying_torso_angle
+        and hip_angles
+        and all(
+            min_sitting_hip_angle <= angle < min_lying_hip_angle
+            for angle in hip_angles
+        )
+    ):
         return "sitting"
 
     # 발목이 가려진 경우에는 상체가 서 있고 어깨-골반-무릎이 직각에 가까운 다리를

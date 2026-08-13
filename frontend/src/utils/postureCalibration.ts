@@ -20,6 +20,16 @@ export interface PostureCalibrationForm {
   standingReferences: string;
 }
 
+export interface PostureCalibrationDraft {
+  version: 1;
+  step: "floor" | "standing";
+  frameSize: { width: number; height: number } | null;
+  floorPoints: CalibrationPoint[];
+  anchorDistanceInputs: Record<keyof FloorAnchorDistances, string>;
+  personHeightM: string;
+  standingReferences: StandingReferencePayload[];
+}
+
 export type CalibrationPoint = [number, number];
 
 export interface CalibrationPerson {
@@ -58,6 +68,78 @@ export interface FloorAnchorDistances {
 
 const MIN_REFERENCE_CONFIDENCE = 0.3;
 const CORE_KEYPOINT_INDICES = [0, 5, 6, 11, 12, 13, 14, 15, 16];
+const DRAFT_STORAGE_PREFIX = "rescue-pose:posture-calibration-draft:v1";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isFinitePoint(value: unknown): value is CalibrationPoint {
+  return (
+    Array.isArray(value)
+    && value.length === 2
+    && value.every((coordinate) => typeof coordinate === "number" && Number.isFinite(coordinate))
+  );
+}
+
+function isStandingReference(value: unknown): value is StandingReferencePayload {
+  if (!isRecord(value) || !isFinitePoint(value.foot_px)) return false;
+  return (
+    typeof value.keypoint_height_px === "number"
+    && Number.isFinite(value.keypoint_height_px)
+    && typeof value.height_m === "number"
+    && Number.isFinite(value.height_m)
+  );
+}
+
+export function postureCalibrationDraftStorageKey(cameraId: number): string {
+  return `${DRAFT_STORAGE_PREFIX}:${cameraId}`;
+}
+
+export function parsePostureCalibrationDraft(raw: string | null): PostureCalibrationDraft | null {
+  if (!raw) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!isRecord(value) || value.version !== 1 || (value.step !== "floor" && value.step !== "standing")) {
+    return null;
+  }
+  const frameSize = value.frameSize;
+  if (
+    frameSize !== null
+    && (
+      !isRecord(frameSize)
+      || typeof frameSize.width !== "number"
+      || !Number.isFinite(frameSize.width)
+      || frameSize.width <= 0
+      || typeof frameSize.height !== "number"
+      || !Number.isFinite(frameSize.height)
+      || frameSize.height <= 0
+    )
+  ) {
+    return null;
+  }
+  const distanceInputs = value.anchorDistanceInputs;
+  if (!isRecord(distanceInputs)) return null;
+  if (
+    !Array.isArray(value.floorPoints)
+    || value.floorPoints.length > 4
+    || !value.floorPoints.every(isFinitePoint)
+    || !(["ab", "ac", "bc", "ad", "bd"] as const).every(
+      (key) => typeof distanceInputs[key] === "string",
+    )
+    || typeof value.personHeightM !== "string"
+    || !Array.isArray(value.standingReferences)
+    || value.standingReferences.length > 20
+    || !value.standingReferences.every(isStandingReference)
+  ) {
+    return null;
+  }
+  return value as unknown as PostureCalibrationDraft;
+}
 
 function parseRows(value: string, columns: number, label: string): number[][] {
   const rows = value
@@ -315,46 +397,17 @@ function scaledVisiblePoints(
 }
 
 /**
- * 보정 화면에서 클릭한 사람을 찾고, backend와 같은 core keypoint extent 및 발목 중심을 뽑는다.
+ * 보정 화면에 검출된 사람이 정확히 한 명일 때 backend와 같은 core keypoint extent와
+ * 발목 중심을 뽑는다. 사람이 없거나 여러 명이면 대상을 임의로 고르지 않는다.
  */
-export function selectStandingReferenceAtPoint(
+export function standingReferenceFromSinglePerson(
   people: CalibrationPerson[],
-  clickPoint: CalibrationPoint,
   detectionFrame: DetectionFrameSize,
   calibrationFrame: CalibrationFrameSize,
   heightM: number,
 ): StandingReferencePayload | null {
-  if (!Number.isFinite(heightM) || heightM < 0.5 || heightM > 2.5) return null;
-
-  let selected: CalibrationPerson | null = null;
-  let selectedDistance = Number.POSITIVE_INFINITY;
-  for (const person of people) {
-    const visible = scaledVisiblePoints(person, detectionFrame, calibrationFrame);
-    if (visible.length < 5) continue;
-    const xs = visible.map((point) => point[0]);
-    const ys = visible.map((point) => point[1]);
-    const minX = Math.min(...xs);
-    const maxX = Math.max(...xs);
-    const minY = Math.min(...ys);
-    const maxY = Math.max(...ys);
-    const padding = Math.max(20, Math.max(maxX - minX, maxY - minY) * 0.12);
-    if (
-      clickPoint[0] < minX - padding
-      || clickPoint[0] > maxX + padding
-      || clickPoint[1] < minY - padding
-      || clickPoint[1] > maxY + padding
-    ) {
-      continue;
-    }
-    const distance = Math.hypot(
-      clickPoint[0] - (minX + maxX) / 2,
-      clickPoint[1] - (minY + maxY) / 2,
-    );
-    if (distance < selectedDistance) {
-      selected = person;
-      selectedDistance = distance;
-    }
-  }
+  if (people.length !== 1 || !Number.isFinite(heightM) || heightM < 0.5 || heightM > 2.5) return null;
+  const selected = people[0];
   if (!selected) return null;
 
   const core = scaledVisiblePoints(
